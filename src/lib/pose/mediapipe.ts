@@ -3,25 +3,28 @@
 import { PoseLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { Landmark } from "@/lib/types";
 
-let poseLandmarker: PoseLandmarker | null = null;
-let initPromise: Promise<PoseLandmarker> | null = null;
+let poseLandmarkerImage: PoseLandmarker | null = null;
+let poseLandmarkerVideo: PoseLandmarker | null = null;
+let initImagePromise: Promise<PoseLandmarker> | null = null;
+let initVideoPromise: Promise<PoseLandmarker> | null = null;
+
+const MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task";
+const WASM_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
 
 /**
- * Initialize MediaPipe PoseLandmarker (singleton)
+ * Initialize MediaPipe PoseLandmarker for IMAGE mode (singleton)
  */
-export async function initPoseLandmarker(): Promise<PoseLandmarker> {
-  if (poseLandmarker) return poseLandmarker;
-  if (initPromise) return initPromise;
+async function initImageLandmarker(): Promise<PoseLandmarker> {
+  if (poseLandmarkerImage) return poseLandmarkerImage;
+  if (initImagePromise) return initImagePromise;
 
-  initPromise = (async () => {
-    const vision = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-    );
-
-    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+  initImagePromise = (async () => {
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    poseLandmarkerImage = await PoseLandmarker.createFromOptions(vision, {
       baseOptions: {
-        modelAssetPath:
-          "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+        modelAssetPath: MODEL_URL,
         delegate: "GPU",
       },
       runningMode: "IMAGE",
@@ -30,11 +33,47 @@ export async function initPoseLandmarker(): Promise<PoseLandmarker> {
       minPosePresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
     });
-
-    return poseLandmarker;
+    return poseLandmarkerImage;
   })();
 
-  return initPromise;
+  return initImagePromise;
+}
+
+/**
+ * Initialize MediaPipe PoseLandmarker for VIDEO mode (singleton)
+ */
+async function initVideoLandmarker(): Promise<PoseLandmarker> {
+  if (poseLandmarkerVideo) return poseLandmarkerVideo;
+  if (initVideoPromise) return initVideoPromise;
+
+  initVideoPromise = (async () => {
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    poseLandmarkerVideo = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: MODEL_URL,
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    return poseLandmarkerVideo;
+  })();
+
+  return initVideoPromise;
+}
+
+function toLandmarks(
+  rawLandmarks: { x: number; y: number; z: number; visibility?: number }[]
+): Landmark[] {
+  return rawLandmarks.map((lm) => ({
+    x: lm.x,
+    y: lm.y,
+    z: lm.z,
+    visibility: lm.visibility ?? 0,
+  }));
 }
 
 /**
@@ -43,84 +82,64 @@ export async function initPoseLandmarker(): Promise<PoseLandmarker> {
 export async function detectPoseFromImage(
   imageElement: HTMLImageElement
 ): Promise<Landmark[] | null> {
-  const landmarker = await initPoseLandmarker();
+  const landmarker = await initImageLandmarker();
   const result = landmarker.detect(imageElement);
 
   if (!result.landmarks || result.landmarks.length === 0) {
     return null;
   }
 
-  return result.landmarks[0].map((lm) => ({
-    x: lm.x,
-    y: lm.y,
-    z: lm.z,
-    visibility: lm.visibility ?? 0,
-  }));
+  return toLandmarks(result.landmarks[0]);
 }
 
 /**
- * Detect pose from a video frame
+ * Extract pose time series from a video at a given FPS.
+ * Returns an array of { timestamp, landmarks } for each successfully detected frame.
+ *
+ * @param video - The HTMLVideoElement (must have metadata loaded)
+ * @param targetFps - Target frames per second to sample (default: 10)
+ * @param onProgress - Optional callback (completedFrames, totalFrames)
+ * @param maxFrames - Maximum number of frames to extract (default: 50)
  */
-export async function detectPoseFromVideo(
-  videoElement: HTMLVideoElement,
-  timestampMs: number
-): Promise<Landmark[] | null> {
-  const landmarker = await initPoseLandmarker();
-
-  // Switch to VIDEO mode if needed
-  if (landmarker.setOptions) {
-    await landmarker.setOptions({ runningMode: "VIDEO" });
-  }
-
-  const result = landmarker.detectForVideo(videoElement, timestampMs);
-
-  if (!result.landmarks || result.landmarks.length === 0) {
-    return null;
-  }
-
-  return result.landmarks[0].map((lm) => ({
-    x: lm.x,
-    y: lm.y,
-    z: lm.z,
-    visibility: lm.visibility ?? 0,
-  }));
-}
-
-/**
- * Extract key frames from a video for analysis
- */
-export async function extractKeyFrames(
-  videoElement: HTMLVideoElement,
-  numFrames: number = 5
+export async function extractPoseTimeSeries(
+  video: HTMLVideoElement,
+  targetFps: number = 10,
+  onProgress?: (completed: number, total: number) => void,
+  maxFrames: number = 50
 ): Promise<{ timestamp: number; landmarks: Landmark[] }[]> {
-  const landmarker = await initPoseLandmarker();
-  await landmarker.setOptions({ runningMode: "VIDEO" });
+  const landmarker = await initVideoLandmarker();
 
-  const duration = videoElement.duration;
-  const interval = duration / (numFrames + 1);
+  const duration = video.duration;
+  const interval = 1 / targetFps;
+  const totalFrames = Math.min(
+    Math.floor(duration * targetFps),
+    maxFrames
+  );
+
   const frames: { timestamp: number; landmarks: Landmark[] }[] = [];
 
-  for (let i = 1; i <= numFrames; i++) {
-    const time = interval * i;
-    videoElement.currentTime = time;
+  for (let i = 0; i < totalFrames; i++) {
+    const time = i * interval;
+    if (time >= duration) break;
+
+    video.currentTime = time;
 
     await new Promise<void>((resolve) => {
-      videoElement.onseeked = () => resolve();
+      video.onseeked = () => resolve();
     });
 
     const timestampMs = Math.round(time * 1000);
-    const result = landmarker.detectForVideo(videoElement, timestampMs);
+    const result = landmarker.detectForVideo(video, timestampMs);
 
     if (result.landmarks && result.landmarks.length > 0) {
       frames.push({
         timestamp: time,
-        landmarks: result.landmarks[0].map((lm) => ({
-          x: lm.x,
-          y: lm.y,
-          z: lm.z,
-          visibility: lm.visibility ?? 0,
-        })),
+        landmarks: toLandmarks(result.landmarks[0]),
       });
+    }
+
+    if (onProgress) {
+      onProgress(i + 1, totalFrames);
     }
   }
 

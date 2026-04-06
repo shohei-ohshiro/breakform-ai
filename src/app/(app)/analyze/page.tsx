@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
-import { Loader2, Zap, Info } from "lucide-react";
+import { useState, useCallback, useEffect, Fragment, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
+import { Loader2, Zap, Info, AlertTriangle, ChevronDown, ChevronUp, Bug } from "lucide-react";
 import Link from "next/link";
 import VideoUploader from "@/components/analysis/VideoUploader";
 import TrickSelector from "@/components/analysis/TrickSelector";
@@ -13,11 +14,9 @@ import {
   Landmark,
   AnalysisResult,
   AnalysisState,
-  JointAngles,
-  CenterOfGravity,
 } from "@/lib/types";
-import { detectPoseFromImage } from "@/lib/pose/mediapipe";
-import { calculateJointAngles, calculateCenterOfGravity } from "@/lib/pose/angles";
+import { detectPoseFromImage, extractPoseTimeSeries } from "@/lib/pose/mediapipe";
+import { TechniqueId } from "@/lib/analysis/types";
 
 const STATE_MESSAGES: Record<AnalysisState, string> = {
   idle: "",
@@ -28,16 +27,64 @@ const STATE_MESSAGES: Record<AnalysisState, string> = {
   error: "エラーが発生しました",
 };
 
-export default function AnalyzePage() {
+interface ViolationItem {
+  ruleId: string;
+  severity: string;
+  status?: string;
+  bodyPart: string;
+  message: string;
+  actual: number;
+  ideal: number;
+  threshold?: { warn: number; fail: number };
+  deviation?: number;
+  unit: string;
+  confidence?: number;
+  scoreImpact?: number;
+}
+
+interface BreakdownItem {
+  category: string;
+  label: string;
+  score: number;
+  weight: number;
+  violations?: ViolationItem[];
+  measurements?: Record<string, number>;
+}
+
+interface ExtendedResult extends AnalysisResult {
+  qualityCheck?: {
+    passed: boolean;
+    overallScore: number;
+    warnings: string[];
+  };
+  viewpoint?: string;
+  breakdown?: BreakdownItem[];
+  // Debug-only fields (returned when ?debug=true)
+  ruleResultJson?: Record<string, unknown>;
+  featureJson?: Record<string, unknown>;
+  eventJson?: unknown[];
+}
+
+export default function AnalyzePageWrapper() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-gray-950" />}>
+      <AnalyzePage />
+    </Suspense>
+  );
+}
+
+function AnalyzePage() {
+  const searchParams = useSearchParams();
+  const isDebugMode = searchParams.get("debug") === "true";
+
   const [state, setState] = useState<AnalysisState>("idle");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [selectedTrick, setSelectedTrick] = useState<Trick | null>(null);
   const [landmarks, setLandmarks] = useState<Landmark[] | null>(null);
-  const [angles, setAngles] = useState<JointAngles | null>(null);
-  const [cog, setCog] = useState<CenterOfGravity | null>(null);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [result, setResult] = useState<ExtendedResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<string>("");
   const [usage, setUsage] = useState<{
     remaining: number;
     limit: number;
@@ -56,10 +103,9 @@ export default function AnalyzePage() {
     setFile(f);
     setPreviewUrl(url);
     setLandmarks(null);
-    setAngles(null);
-    setCog(null);
     setResult(null);
     setError(null);
+    setProgress("");
     setState("idle");
   }, []);
 
@@ -70,87 +116,94 @@ export default function AnalyzePage() {
     setResult(null);
 
     try {
-      // Step 1: Detect pose
       setState("detecting");
 
-      let detectedLandmarks: Landmark[] | null = null;
+      const isVideo = file.type.startsWith("video/");
+      let frames: { timestamp: number; landmarks: Landmark[] }[] = [];
+      let fps = 10;
+      let duration = 0;
 
-      if (file.type.startsWith("image/")) {
-        // Load image and detect pose
+      if (isVideo) {
+        // Multi-frame extraction for video
+        const video = document.getElementById("uploaded-video") as HTMLVideoElement;
+        if (!video) throw new Error("動画が見つかりません");
+
+        // Ensure video metadata is loaded
+        if (video.readyState < 1) {
+          await new Promise<void>((resolve) => {
+            video.onloadedmetadata = () => resolve();
+          });
+        }
+
+        duration = video.duration;
+        setProgress(`動画から骨格を抽出中... (${duration.toFixed(1)}秒)`);
+
+        frames = await extractPoseTimeSeries(video, fps, (completed, total) => {
+          setProgress(`骨格検出中: ${completed}/${total} フレーム`);
+        });
+
+        if (frames.length === 0) {
+          throw new Error(
+            "ポーズを検出できませんでした。人物がはっきり写っている動画を使用してください。"
+          );
+        }
+
+        // Show first frame landmarks for preview
+        setLandmarks(frames[0].landmarks);
+      } else {
+        // Single frame for image
         const img = document.getElementById("uploaded-image") as HTMLImageElement;
         if (!img) throw new Error("画像が見つかりません");
 
-        // Wait for image to be fully loaded
         if (!img.complete) {
           await new Promise<void>((resolve) => {
             img.onload = () => resolve();
           });
         }
 
-        detectedLandmarks = await detectPoseFromImage(img);
-      } else {
-        // For video, capture current frame
-        const video = document.getElementById("uploaded-video") as HTMLVideoElement;
-        if (!video) throw new Error("動画が見つかりません");
+        const detectedLandmarks = await detectPoseFromImage(img);
+        if (!detectedLandmarks) {
+          throw new Error(
+            "ポーズを検出できませんでした。人物がはっきり写っている画像を使用してください。"
+          );
+        }
 
-        // Create a canvas from the current video frame
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("Canvas context error");
-        ctx.drawImage(video, 0, 0);
-
-        // Create an image from canvas
-        const imgUrl = canvas.toDataURL("image/jpeg");
-        const img = new Image();
-        img.src = imgUrl;
-        await new Promise<void>((resolve) => {
-          img.onload = () => resolve();
-        });
-
-        detectedLandmarks = await detectPoseFromImage(img);
+        setLandmarks(detectedLandmarks);
+        frames = [{ timestamp: 0, landmarks: detectedLandmarks }];
+        duration = 0;
       }
 
-      if (!detectedLandmarks) {
-        throw new Error(
-          "ポーズを検出できませんでした。人物がはっきり写っている画像/動画を使用してください。"
-        );
-      }
-
-      setLandmarks(detectedLandmarks);
-
-      // Step 2: Calculate angles and center of gravity
-      const calculatedAngles = calculateJointAngles(detectedLandmarks);
-      const calculatedCog = calculateCenterOfGravity(detectedLandmarks);
-      setAngles(calculatedAngles);
-      setCog(calculatedCog);
-
-      // Step 3: Send to Claude API for analysis
+      // Send to new pipeline API
       setState("analyzing");
+      setProgress("ルールベース分析中...");
 
-      const response = await fetch("/api/analyze", {
+      const analyzeUrl = isDebugMode ? "/api/analyze?debug=true" : "/api/analyze";
+      const response = await fetch(analyzeUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          trickName: selectedTrick.name,
+          technique: selectedTrick.id as TechniqueId,
           trickNameJa: selectedTrick.name_ja,
           trickId: selectedTrick.id,
-          angles: calculatedAngles,
-          landmarks: detectedLandmarks,
-          mediaType: file.type.startsWith("video/") ? "video" : "photo",
+          frames,
+          sourceType: isVideo ? "video" : "image",
+          fps,
+          duration,
         }),
       });
 
       if (!response.ok) {
-        throw new Error("分析に失敗しました。もう一度お試しください。");
+        const errData = await response.json().catch(() => null);
+        throw new Error(
+          errData?.error || "分析に失敗しました。もう一度お試しください。"
+        );
       }
 
-      const analysisResult: AnalysisResult = await response.json();
+      const analysisResult: ExtendedResult = await response.json();
       setResult(analysisResult);
       setState("complete");
 
-      // Refresh usage count
+      // Refresh usage
       fetch("/api/usage")
         .then((r) => r.json())
         .then(setUsage)
@@ -162,6 +215,7 @@ export default function AnalyzePage() {
     }
   };
 
+  const [showDebug, setShowDebug] = useState(false);
   const isAnalyzing = state === "detecting" || state === "analyzing";
   const canAnalyze = !!file && !!selectedTrick && !isAnalyzing;
 
@@ -170,13 +224,19 @@ export default function AnalyzePage() {
       <div className="max-w-5xl mx-auto px-4 py-8">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold text-white">
-            フォーム分析
-          </h1>
+          <h1 className="text-3xl font-bold text-white">フォーム分析</h1>
           <p className="text-gray-400 mt-1">
             動画や写真をアップロードして、AIがあなたのフォームを分析します
           </p>
         </div>
+
+        {/* Debug Mode Banner */}
+        {isDebugMode && (
+          <div className="mb-6 flex items-center gap-2 p-3 bg-purple-500/10 border border-purple-500/30 rounded-lg text-sm text-purple-300">
+            <Bug className="w-4 h-4 flex-shrink-0" />
+            <span>デバッグモード ON — 分析後に詳細JSON（feature / event / rule_result）を表示します</span>
+          </div>
+        )}
 
         {/* Usage Banner */}
         {usage && (
@@ -237,7 +297,7 @@ export default function AnalyzePage() {
               {isAnalyzing ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  {STATE_MESSAGES[state]}
+                  {progress || STATE_MESSAGES[state]}
                 </>
               ) : (
                 <>
@@ -256,7 +316,7 @@ export default function AnalyzePage() {
 
           {/* Right: Results */}
           <div className="space-y-6">
-            {/* Pose Canvas with skeleton overlay */}
+            {/* Pose Canvas */}
             {landmarks && previewUrl && (
               <div>
                 <h3 className="text-sm font-medium text-gray-400 mb-2">
@@ -265,37 +325,59 @@ export default function AnalyzePage() {
                 <PoseCanvas
                   imageUrl={previewUrl}
                   landmarks={landmarks}
-                  cog={cog}
                   height={500}
                 />
               </div>
             )}
 
-            {/* Angles Display */}
-            {angles && (
+            {/* Quality Warnings */}
+            {result?.qualityCheck && result.qualityCheck.warnings.length > 0 && (
+              <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
+                <h3 className="text-sm font-medium text-yellow-400 mb-2 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4" />
+                  品質に関する注意
+                </h3>
+                <ul className="text-sm text-yellow-300/80 space-y-1">
+                  {result.qualityCheck.warnings.map((w, i) => (
+                    <li key={i}>- {w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Score Breakdown */}
+            {result?.breakdown && result.breakdown.length > 0 && (
               <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
                 <h3 className="text-sm font-medium text-gray-400 mb-3">
-                  検出された関節角度
+                  スコア内訳
+                  {result.viewpoint && (
+                    <span className="ml-2 text-xs text-gray-500">
+                      (撮影アングル: {result.viewpoint})
+                    </span>
+                  )}
                 </h3>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  {[
-                    { label: "左肩", value: angles.leftShoulder },
-                    { label: "右肩", value: angles.rightShoulder },
-                    { label: "左肘", value: angles.leftElbow },
-                    { label: "右肘", value: angles.rightElbow },
-                    { label: "左股関節", value: angles.leftHip },
-                    { label: "右股関節", value: angles.rightHip },
-                    { label: "左膝", value: angles.leftKnee },
-                    { label: "右膝", value: angles.rightKnee },
-                    { label: "背骨", value: angles.spineAngle },
-                  ].map((item) => (
-                    <div
-                      key={item.label}
-                      className="flex justify-between px-3 py-1.5 bg-gray-900/50 rounded"
-                    >
-                      <span className="text-gray-400">{item.label}</span>
-                      <span className="text-gray-200 font-mono">
-                        {item.value}°
+                <div className="space-y-2">
+                  {result.breakdown.map((b) => (
+                    <div key={b.category} className="flex items-center gap-3">
+                      <span className="text-sm text-gray-300 w-28 flex-shrink-0">
+                        {b.label}
+                      </span>
+                      <div className="flex-1 bg-gray-700 rounded-full h-2.5">
+                        <div
+                          className={`h-2.5 rounded-full transition-all duration-500 ${
+                            b.score >= 80
+                              ? "bg-green-400"
+                              : b.score >= 60
+                                ? "bg-yellow-400"
+                                : b.score >= 40
+                                  ? "bg-orange-400"
+                                  : "bg-red-400"
+                          }`}
+                          style={{ width: `${b.score}%` }}
+                        />
+                      </div>
+                      <span className="text-sm font-mono text-gray-300 w-10 text-right">
+                        {b.score}
                       </span>
                     </div>
                   ))}
@@ -308,10 +390,145 @@ export default function AnalyzePage() {
               <>
                 <ScoreCard result={result} />
                 <AdvicePanel result={result} />
+
+                {/* Debug: Violation Details */}
+                {result.breakdown && result.breakdown.some(b => b.violations && b.violations.length > 0) && (
+                  <div className="bg-gray-800/30 rounded-xl border border-gray-700/50">
+                    <button
+                      onClick={() => setShowDebug(!showDebug)}
+                      className="w-full flex items-center justify-between p-4 text-sm text-gray-500 hover:text-gray-400"
+                    >
+                      <span>詳細分析データ</span>
+                      {showDebug ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </button>
+                    {showDebug && (
+                      <div className="px-4 pb-4 space-y-4">
+                        {result.breakdown.map((b) => (
+                          <Fragment key={b.category}>
+                            <div>
+                              <div className="flex items-center gap-2 mb-1">
+                                <h4 className="text-xs font-medium text-gray-400">{b.label}</h4>
+                                <span className="text-[10px] text-gray-600 font-mono">{b.category}</span>
+                                <span className="text-[10px] text-gray-600">w={b.weight.toFixed(2)}</span>
+                              </div>
+                              {b.violations && b.violations.length > 0 ? (
+                                <div className="space-y-1.5">
+                                  {b.violations.map((v, i) => (
+                                    <div key={i} className="ml-2 text-xs border-l-2 pl-2 py-0.5" style={{
+                                      borderColor: v.severity === "critical" ? "#f87171" : v.severity === "major" ? "#fbbf24" : "#6b7280"
+                                    }}>
+                                      <div className="flex items-center gap-1.5">
+                                        <span className={
+                                          v.severity === "critical" ? "text-red-400" :
+                                          v.severity === "major" ? "text-yellow-400" : "text-gray-400"
+                                        }>
+                                          [{v.severity}]
+                                        </span>
+                                        <span className="text-gray-300">{v.message}</span>
+                                        {v.scoreImpact != null && v.scoreImpact > 0 && (
+                                          <span className="text-red-400/70 text-[10px]">-{v.scoreImpact.toFixed(1)}pt</span>
+                                        )}
+                                      </div>
+                                      <div className="text-[10px] text-gray-600 mt-0.5 font-mono flex flex-wrap gap-x-3">
+                                        <span>rule: {v.ruleId}</span>
+                                        <span>実測: {typeof v.actual === "number" ? v.actual.toFixed(2) : v.actual}{v.unit}</span>
+                                        <span>理想: {typeof v.ideal === "number" ? v.ideal.toFixed(2) : v.ideal}{v.unit}</span>
+                                        {v.threshold && (
+                                          <span>閾値: warn={v.threshold.warn} fail={v.threshold.fail}</span>
+                                        )}
+                                        {v.confidence != null && (
+                                          <span>conf={v.confidence.toFixed(2)}</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="ml-2 text-[10px] text-green-500/60">pass</div>
+                              )}
+                              {b.measurements && Object.keys(b.measurements).length > 0 && (
+                                <div className="ml-2 mt-1 text-[10px] text-gray-600 font-mono">
+                                  measurements: {Object.entries(b.measurements).map(([k, v]) =>
+                                    `${k}=${typeof v === "number" ? v.toFixed(2) : v}`
+                                  ).join(", ")}
+                                </div>
+                              )}
+                            </div>
+                          </Fragment>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>
         </div>
+
+        {/* Debug JSON Panels — only when ?debug=true and result exists */}
+        {isDebugMode && result && (
+          <div className="mt-8 space-y-4">
+            <h2 className="text-lg font-semibold text-purple-300 flex items-center gap-2">
+              <Bug className="w-5 h-5" />
+              デバッグデータ
+            </h2>
+
+            {/* Quality Check */}
+            {result.qualityCheck && (
+              <DebugJsonSection title="quality_check_result" data={result.qualityCheck} />
+            )}
+
+            {/* Rule Result */}
+            {result.ruleResultJson && (
+              <DebugJsonSection title="rule_result_json" data={result.ruleResultJson} />
+            )}
+
+            {/* Feature JSON */}
+            {result.featureJson && (
+              <DebugJsonSection title="feature_json" data={result.featureJson} />
+            )}
+
+            {/* Event JSON */}
+            {result.eventJson && result.eventJson.length > 0 && (
+              <DebugJsonSection title="event_json" data={result.eventJson} />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Collapsible JSON viewer for debug mode */
+function DebugJsonSection({ title, data }: { title: string; data: unknown }) {
+  const [open, setOpen] = useState(false);
+  const jsonStr = JSON.stringify(data, null, 2);
+  const previewStr = jsonStr.length > 200 ? jsonStr.slice(0, 200) + "…" : jsonStr;
+
+  return (
+    <div className="bg-gray-900 border border-gray-700/50 rounded-lg overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between p-3 text-sm hover:bg-gray-800/50"
+      >
+        <span className="font-mono text-purple-400">{title}</span>
+        <div className="flex items-center gap-2 text-gray-500">
+          <span className="text-xs">{jsonStr.length.toLocaleString()} chars</span>
+          {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+        </div>
+      </button>
+      <div className="px-3 pb-3">
+        <pre className="text-[11px] font-mono text-gray-400 whitespace-pre-wrap break-all max-h-96 overflow-y-auto bg-black/30 rounded p-2">
+          {open ? jsonStr : previewStr}
+        </pre>
+        {!open && jsonStr.length > 200 && (
+          <button
+            onClick={() => setOpen(true)}
+            className="mt-1 text-xs text-purple-400 hover:text-purple-300"
+          >
+            全て表示
+          </button>
+        )}
       </div>
     </div>
   );

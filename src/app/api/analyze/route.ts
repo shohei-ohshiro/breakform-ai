@@ -1,49 +1,45 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
-import Anthropic from "@anthropic-ai/sdk";
-import { AnalysisResult, Landmark, JointAngles } from "@/lib/types";
 import { checkUsageLimit, incrementUsage } from "@/lib/usage";
+import { runPipeline } from "@/lib/analysis/pipeline";
+import { PipelineInput, TechniqueId, PoseFrame } from "@/lib/analysis/types";
+import { Landmark } from "@/lib/types";
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY!,
-});
-
-const SYSTEM_PROMPT = `あなたはブレイクダンスとアクロバットの専門コーチAIです。
-骨格データ（関節角度と座標）を分析し、具体的で実用的なフィードバックを提供します。
-
-回答のルール:
-- 日本語で回答すること
-- 具体的な数値を含めること（角度の差、推奨レップ数等）
-- 怪我予防を最優先に考えること
-- 初心者にもわかりやすい言葉で説明すること
-- 筋トレ/ストレッチの提案には必ず種目名・回数・頻度を含めること
-- 「インナーマッスルから鍛える」等の段階的アプローチを推奨すること
-- JSONのみを返すこと（余計なテキストは不要）`;
-
-interface AnalyzeRequest {
-  trickName: string;
+interface AnalyzeRequestV2 {
+  technique: TechniqueId;
   trickNameJa: string;
   trickId: string;
-  angles: JointAngles;
-  landmarks: Landmark[];
-  mediaType: "photo" | "video";
+  frames: { timestamp: number; landmarks: Landmark[] }[];
+  sourceType: "image" | "video";
+  fps: number;
+  duration: number;
+  userLevel?: "beginner" | "intermediate" | "advanced" | "expert";
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body: AnalyzeRequest = await request.json();
-    const { trickName, trickNameJa, trickId, angles, landmarks, mediaType } =
-      body;
+    const body: AnalyzeRequestV2 = await request.json();
+    const { technique, trickId, trickNameJa, frames, sourceType, fps, duration, userLevel } = body;
 
-    if (!trickName || !angles || !landmarks) {
+    if (!technique || !frames || frames.length === 0) {
       return NextResponse.json(
         { error: "Missing required fields" },
         { status: 400 }
       );
     }
 
-    // --- Auth & Usage Check (only if Supabase is configured) ---
+    // Validate technique
+    const validTechniques: TechniqueId[] = ["handstand", "planche", "swipes"];
+    if (!validTechniques.includes(technique)) {
+      return NextResponse.json(
+        { error: `対応していない技です: ${technique}` },
+        { status: 400 }
+      );
+    }
+
+    // --- Auth & Usage Check ---
     let userId: string | null = null;
+    let experienceLevel: string | null = null;
 
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -83,78 +79,38 @@ export async function POST(request: NextRequest) {
             { status: 429 }
           );
         }
+
+        // Fetch user experience level
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("experience_level")
+          .eq("id", user.id)
+          .single();
+        experienceLevel = profile?.experience_level ?? null;
       }
     }
 
-    // --- Claude API Analysis ---
-    const userPrompt = `
-## 分析対象
-技名: ${trickNameJa}（${trickName}）
-
-## 骨格データ
-関節角度:
-- 左肩: ${angles.leftShoulder}°
-- 右肩: ${angles.rightShoulder}°
-- 左肘: ${angles.leftElbow}°
-- 右肘: ${angles.rightElbow}°
-- 左股関節: ${angles.leftHip}°
-- 右股関節: ${angles.rightHip}°
-- 左膝: ${angles.leftKnee}°
-- 右膝: ${angles.rightKnee}°
-- 背骨の角度: ${angles.spineAngle}°
-- 骨盤の傾き: ${angles.hipAlignment}°
-- 肩の傾き: ${angles.shoulderAlignment}°
-
-ランドマーク座標（33点、正規化済み 0-1）:
-${JSON.stringify(landmarks.map((l, i) => ({ index: i, x: Math.round(l.x * 1000) / 1000, y: Math.round(l.y * 1000) / 1000, visibility: Math.round(l.visibility * 100) / 100 })))}
-
-## 求める回答フォーマット（JSONのみ返してください）
-{
-  "score": 0から100の数値,
-  "issues": [
-    {
-      "priority": 1から3の優先度,
-      "body_part": "対象部位",
-      "description": "問題の説明（理想角度との差分を含む）",
-      "ideal_angle": 理想の角度（数値）,
-      "actual_angle": 実測値（数値）
-    }
-  ],
-  "advice": [
-    {
-      "type": "training または stretch または warmup または injury_prevention",
-      "related_issue": 1から3の対応するissue番号,
-      "content": "具体的なアドバイス（種目名、レップ数、セット数、頻度を含む）"
-    }
-  ],
-  "summary": "総合コメント（50-100文字）"
-}`;
-
-    const message = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 2048,
-      messages: [
-        {
-          role: "user",
-          content: userPrompt,
-        },
-      ],
-      system: SYSTEM_PROMPT,
-    });
-
-    const responseText =
-      message.content[0].type === "text" ? message.content[0].text : "";
-
-    // Extract JSON from response (handle potential markdown code blocks)
-    let jsonStr = responseText;
-    const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1].trim();
+    // --- Run Analysis Pipeline ---
+    const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicApiKey) {
+      return NextResponse.json(
+        { error: "API key not configured" },
+        { status: 500 }
+      );
     }
 
-    const result: AnalysisResult = JSON.parse(jsonStr);
+    const pipelineInput: PipelineInput = {
+      frames: frames as PoseFrame[],
+      technique,
+      sourceType,
+      fps: fps || 10,
+      duration: duration || 0,
+      userLevel: (userLevel ?? experienceLevel ?? "beginner") as PipelineInput["userLevel"],
+    };
 
-    // --- Save result & increment usage (if user is logged in and Supabase configured) ---
+    const result = await runPipeline(pipelineInput, anthropicApiKey);
+
+    // --- Save result & increment usage ---
     if (userId && supabaseUrl && supabaseAnonKey) {
       const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
         cookies: {
@@ -167,26 +123,51 @@ ${JSON.stringify(landmarks.map((l, i) => ({ index: i, x: Math.round(l.x * 1000) 
         },
       });
 
-      // Save analysis result
       await supabase.from("analyses").insert({
         user_id: userId,
-        trick_id: trickId || trickName,
-        trick_name: trickName,
+        trick_id: trickId || technique,
+        trick_name: technique,
         trick_name_ja: trickNameJa,
-        media_type: mediaType || "photo",
-        landmarks,
-        angles,
-        score: result.score,
+        media_type: sourceType,
+        // Legacy fields (set to null — no longer sending raw landmarks to DB)
+        landmarks: null,
+        angles: null,
+        // New pipeline data
+        score: result.finalScore,
         issues: result.issues,
         advice: result.advice,
         summary: result.summary,
+        feature_json: result.featureJson,
+        event_json: result.eventJson,
+        rule_result_json: result.ruleResultJson,
+        viewpoint: result.viewpoint,
+        quality_check_result: result.qualityCheck,
+        final_score: result.finalScore,
       });
 
-      // Increment usage count
       await incrementUsage(supabase, userId);
     }
 
-    return NextResponse.json(result);
+    // Return UI-compatible result
+    const debugMode = new URL(request.url).searchParams.get("debug") === "true";
+
+    const responseBody: Record<string, unknown> = {
+      score: result.score,
+      issues: result.issues,
+      advice: result.advice,
+      summary: result.summary,
+      qualityCheck: result.qualityCheck,
+      viewpoint: result.viewpoint,
+      breakdown: result.ruleResultJson.breakdown,
+    };
+
+    if (debugMode) {
+      responseBody.ruleResultJson = result.ruleResultJson;
+      responseBody.featureJson = result.featureJson;
+      responseBody.eventJson = result.eventJson;
+    }
+
+    return NextResponse.json(responseBody);
   } catch (error) {
     console.error("Analysis error:", error);
     return NextResponse.json(
