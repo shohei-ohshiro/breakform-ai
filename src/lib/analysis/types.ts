@@ -280,6 +280,14 @@ export interface EvaluationResult {
     staticIntervalUsed: StaticInterval | null;
     totalFrames: number;
     configVersion: string;
+    /** For static techniques: was the video classified as hold or entry? */
+    evaluationMode?: "hold" | "entry";
+    /** Duration (seconds) of the static interval used for evaluation */
+    holdDuration?: number;
+    /** Ratio of hold duration to total video duration (0-1) */
+    holdRatio?: number;
+    /** Human-readable note about confidence / evaluation mode */
+    confidenceNote?: string;
   };
 }
 

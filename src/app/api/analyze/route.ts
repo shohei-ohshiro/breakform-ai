@@ -159,6 +159,14 @@ export async function POST(request: NextRequest) {
       qualityCheck: result.qualityCheck,
       viewpoint: result.viewpoint,
       breakdown: result.ruleResultJson.breakdown,
+      meta: {
+        evaluationMode: result.ruleResultJson.meta.evaluationMode,
+        holdDuration: result.ruleResultJson.meta.holdDuration,
+        holdRatio: result.ruleResultJson.meta.holdRatio,
+        confidenceNote: result.ruleResultJson.meta.confidenceNote,
+        analyzedFrameRange: result.ruleResultJson.meta.analyzedFrameRange,
+        totalFrames: result.ruleResultJson.meta.totalFrames,
+      },
     };
 
     if (debugMode) {

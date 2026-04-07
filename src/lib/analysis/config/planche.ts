@@ -39,5 +39,21 @@ export const PLANCHE_CONFIG = {
   weights: {
     imageMode: [0.35, 0.30, 0.25, 0.10],
     videoMode: [0.25, 0.25, 0.20, 0.10, 0.20],
+    /** Entry mode: no stability, more weight on shoulder lean / body line trajectory */
+    entryMode: [0.30, 0.25, 0.20, 0.10, 0.15], // last = entryQuality
+  },
+
+  /**
+   * Hold vs entry classification thresholds.
+   * A "hold" requires a static interval of at least minHoldDuration seconds.
+   * Below that → entry evaluation mode.
+   */
+  holdDetection: {
+    /** Minimum static interval duration to classify as hold (seconds) */
+    minHoldDuration: 1.0,
+    /** Hold duration below this triggers a "short hold" warning (seconds) */
+    shortHoldWarning: 2.0,
+    /** Confidence multiplier for entry mode (applied to final score context) */
+    entryConfidenceMultiplier: 0.8,
   },
 } as const;

@@ -147,6 +147,48 @@ function plancheBentElbowLandmarks(): Landmark[] {
   });
 }
 
+/**
+ * Planche entry attempt: body starts upright and leans forward,
+ * never reaching a stable horizontal hold. Simulates someone
+ * pressing into planche but not fully achieving the position.
+ */
+function makePlancheEntry(): PoseTimeSeries {
+  const fps = 10;
+  const frames: PoseFrame[] = [];
+
+  // 15 frames over 1.5 seconds — body progressively tilts toward horizontal
+  for (let i = 0; i < 15; i++) {
+    const t = i / fps;
+    // Progress: 0 = upright, 1 = almost horizontal (but never gets there)
+    const progress = i / 14;
+    // Spine goes from ~30° (upright lean) to ~55° (halfway to horizontal 90°)
+    const hipY = 0.50 - progress * 0.10; // hips rise slightly
+    const ankleY = 0.40 - progress * 0.15; // ankles rise more
+    const shoulderY = 0.55 + progress * 0.02; // shoulders stay roughly level
+
+    const landmarks = fill33({
+      [LM.NOSE]:            lm(0.30, shoulderY + 0.05),
+      [LM.LEFT_EAR]:        lm(0.28, shoulderY + 0.04, 0.02, 0.8),
+      [LM.RIGHT_EAR]:       lm(0.32, shoulderY + 0.04, 0.02, 0.8),
+      [LM.LEFT_WRIST]:      lm(0.30, 0.65),
+      [LM.RIGHT_WRIST]:     lm(0.40, 0.65),
+      [LM.LEFT_ELBOW]:      lm(0.30, 0.60),
+      [LM.RIGHT_ELBOW]:     lm(0.40, 0.60),
+      [LM.LEFT_SHOULDER]:   lm(0.35, shoulderY),
+      [LM.RIGHT_SHOULDER]:  lm(0.45, shoulderY),
+      [LM.LEFT_HIP]:        lm(0.55, hipY),
+      [LM.RIGHT_HIP]:       lm(0.65, hipY),
+      [LM.LEFT_KNEE]:       lm(0.70, ankleY + 0.05),
+      [LM.RIGHT_KNEE]:      lm(0.80, ankleY + 0.05),
+      [LM.LEFT_ANKLE]:      lm(0.85, ankleY),
+      [LM.RIGHT_ANKLE]:     lm(0.95, ankleY),
+    });
+    frames.push({ timestamp: t, landmarks });
+  }
+
+  return { frames, fps, duration: 1.5, sourceType: "video" };
+}
+
 // ============================================
 // Swipes Fixtures
 // ============================================
@@ -286,8 +328,11 @@ export const FIXTURES = {
     archedBack: () => makeVideoFromLandmarks(archedHandstandLandmarks, 15, 10),
   },
   planche: {
-    hipSag: () => makeVideoFromLandmarks(plancheHipSagLandmarks, 15, 10),
-    bentElbow: () => makeVideoFromLandmarks(plancheBentElbowLandmarks, 15, 10),
+    /** Static hold with hip sag (zero jitter → reliably detected as hold) */
+    hipSag: () => makeVideoFromLandmarks(plancheHipSagLandmarks, 20, 10, 0),
+    bentElbow: () => makeVideoFromLandmarks(plancheBentElbowLandmarks, 20, 10, 0),
+    /** Entry attempt — progressive lean, no stable hold */
+    entry: makePlancheEntry,
   },
   swipes: {
     withEvents: makeSwipesWithEvents,

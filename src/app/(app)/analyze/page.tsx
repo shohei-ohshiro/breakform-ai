@@ -59,6 +59,14 @@ interface ExtendedResult extends AnalysisResult {
   };
   viewpoint?: string;
   breakdown?: BreakdownItem[];
+  meta?: {
+    evaluationMode?: "hold" | "entry";
+    holdDuration?: number;
+    holdRatio?: number;
+    confidenceNote?: string;
+    analyzedFrameRange?: [number, number];
+    totalFrames?: number;
+  };
   // Debug-only fields (returned when ?debug=true)
   ruleResultJson?: Record<string, unknown>;
   featureJson?: Record<string, unknown>;
@@ -342,6 +350,39 @@ function AnalyzePage() {
                     <li key={i}>- {w}</li>
                   ))}
                 </ul>
+              </div>
+            )}
+
+            {/* Evaluation Mode Banner */}
+            {result?.meta?.evaluationMode && (
+              <div className={`rounded-xl p-4 border ${
+                result.meta.evaluationMode === "entry"
+                  ? "bg-blue-500/10 border-blue-500/30"
+                  : result.meta.confidenceNote
+                    ? "bg-yellow-500/10 border-yellow-500/30"
+                    : "bg-green-500/10 border-green-500/30"
+              }`}>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className={`text-sm font-medium ${
+                    result.meta.evaluationMode === "entry" ? "text-blue-400" : "text-green-400"
+                  }`}>
+                    {result.meta.evaluationMode === "entry" ? "進入フォーム評価" : "保持評価"}
+                  </span>
+                  {result.meta.holdDuration != null && result.meta.holdDuration > 0 && (
+                    <span className="text-xs text-gray-500">
+                      (静止保持: {result.meta.holdDuration.toFixed(1)}秒)
+                    </span>
+                  )}
+                  {result.meta.analyzedFrameRange && (
+                    <span className="text-xs text-gray-600 font-mono">
+                      frame {result.meta.analyzedFrameRange[0]}–{result.meta.analyzedFrameRange[1]}
+                      {result.meta.totalFrames != null && ` / ${result.meta.totalFrames}`}
+                    </span>
+                  )}
+                </div>
+                {result.meta.confidenceNote && (
+                  <p className="text-xs text-gray-400">{result.meta.confidenceNote}</p>
+                )}
               </div>
             )}
 

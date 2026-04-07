@@ -153,13 +153,13 @@ describe("Swipes Regression", () => {
 // ---- Cross-technique stability ----
 
 describe("Cross-technique stability", () => {
-  it("all techniques return configVersion 2.0", () => {
+  it("all techniques return expected configVersion", () => {
     const hs = runEval("handstand", FIXTURES.handstand.good());
     const pl = runEval("planche", FIXTURES.planche.hipSag());
     const sw = runEval("swipes", FIXTURES.swipes.withEvents());
 
     expect(hs.meta.configVersion).toBe("2.0");
-    expect(pl.meta.configVersion).toBe("2.0");
+    expect(pl.meta.configVersion).toBe("2.1");
     expect(sw.meta.configVersion).toBe("2.0");
   });
 

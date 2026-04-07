@@ -9,6 +9,7 @@ import {
   makeImageSeries,
   makeVideoSeries,
 } from "./mock-data";
+import { FIXTURES } from "./fixtures";
 
 describe("HandstandEvaluator", () => {
   it("returns a score for a single handstand image", () => {
@@ -116,14 +117,15 @@ describe("PlancheEvaluator", () => {
     expect(elbowBreakdown!.score).toBeGreaterThanOrEqual(0);
   });
 
-  it("includes meta with configVersion", () => {
+  it("includes meta with configVersion and evaluationMode", () => {
     const series = makeImageSeries(makePlancheLandmarks());
     const normalized = normalizePoseTimeSeries(series);
     const features = extractFeatures(normalized);
     const result = evaluate("planche", normalized, features);
 
     expect(result.meta).toBeDefined();
-    expect(result.meta.configVersion).toBe("2.0");
+    expect(result.meta.configVersion).toBe("2.1");
+    expect(result.meta.evaluationMode).toBe("hold"); // image → always hold
   });
 
   it("breakdown categories have measurements", () => {
@@ -135,6 +137,33 @@ describe("PlancheEvaluator", () => {
     for (const b of result.breakdown) {
       expect(b.measurements).toBeDefined();
     }
+  });
+
+  it("classifies entry video as entry mode", () => {
+    const series = FIXTURES.planche.entry();
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized);
+    const result = evaluate("planche", normalized, features);
+
+    expect(result.meta.evaluationMode).toBe("entry");
+    expect(result.meta.confidenceNote).toBeDefined();
+    expect(result.meta.confidenceNote!.length).toBeGreaterThan(0);
+    // Entry mode should have an entry_quality breakdown
+    const entryBreakdown = result.breakdown.find(b => b.category === "entry_quality");
+    expect(entryBreakdown).toBeDefined();
+    expect(entryBreakdown!.label).toBe("進入フォーム");
+  });
+
+  it("hold video with sufficient static interval → hold mode", () => {
+    const series = FIXTURES.planche.hipSag();
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized);
+    const result = evaluate("planche", normalized, features);
+
+    expect(result.meta.evaluationMode).toBe("hold");
+    // Hold mode should NOT have entry_quality
+    const entryBreakdown = result.breakdown.find(b => b.category === "entry_quality");
+    expect(entryBreakdown).toBeUndefined();
   });
 });
 
