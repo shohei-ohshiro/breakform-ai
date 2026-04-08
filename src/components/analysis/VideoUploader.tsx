@@ -6,11 +6,17 @@ import { Upload, Camera, X, Video, Image as ImageIcon } from "lucide-react";
 interface VideoUploaderProps {
   onFileSelected: (file: File, previewUrl: string) => void;
   accept?: string;
+  /** When true, show an overlay preventing confusion between seek and playback */
+  isAnalyzing?: boolean;
+  /** Progress text to show during analysis */
+  analysisProgress?: string;
 }
 
 export default function VideoUploader({
   onFileSelected,
   accept = "image/*,video/*",
+  isAnalyzing = false,
+  analysisProgress,
 }: VideoUploaderProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
@@ -186,13 +192,28 @@ export default function VideoUploader({
           </button>
 
           {fileType === "video" ? (
-            <video
-              src={preview}
-              controls
-              playsInline
-              className="w-full max-h-[500px] object-contain"
-              id="uploaded-video"
-            />
+            <div className="relative">
+              <video
+                src={preview}
+                controls={!isAnalyzing}
+                playsInline
+                className={`w-full max-h-[500px] object-contain ${isAnalyzing ? "pointer-events-none" : ""}`}
+                id="uploaded-video"
+              />
+              {isAnalyzing && (
+                <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-3">
+                  <div className="w-8 h-8 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
+                  <div className="text-center px-4">
+                    <p className="text-sm font-medium text-green-400">
+                      {analysisProgress || "解析中..."}
+                    </p>
+                    <p className="text-xs text-gray-400 mt-1">
+                      動画全体を走査しています（プレビューの表示位置とは異なります）
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
           ) : (
             // eslint-disable-next-line @next/next/no-img-element
             <img

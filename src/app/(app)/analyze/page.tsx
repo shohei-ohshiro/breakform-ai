@@ -16,7 +16,7 @@ import {
   AnalysisState,
 } from "@/lib/types";
 import { detectPoseFromImage, extractPoseTimeSeries } from "@/lib/pose/mediapipe";
-import { TechniqueId } from "@/lib/analysis/types";
+import { TechniqueId, SamplingInfo } from "@/lib/analysis/types";
 
 const STATE_MESSAGES: Record<AnalysisState, string> = {
   idle: "",
@@ -51,6 +51,23 @@ interface BreakdownItem {
   measurements?: Record<string, number>;
 }
 
+interface CoverageInfoUI {
+  fullScanPerformed: boolean;
+  coarseScanTimeRange: [number, number];
+  finalScoringWindow: {
+    startTime: number;
+    endTime: number;
+    reason: string;
+  };
+  analysisPhases: {
+    phase: string;
+    description: string;
+    timeRange: [number, number];
+    frameCount: number;
+  }[];
+  summary: string;
+}
+
 interface ExtendedResult extends AnalysisResult {
   qualityCheck?: {
     passed: boolean;
@@ -59,6 +76,8 @@ interface ExtendedResult extends AnalysisResult {
   };
   viewpoint?: string;
   breakdown?: BreakdownItem[];
+  qualityLevel?: "good" | "reference" | "retry";
+  qualityExplanation?: string;
   meta?: {
     evaluationMode?: "hold" | "entry";
     holdDuration?: number;
@@ -66,6 +85,45 @@ interface ExtendedResult extends AnalysisResult {
     confidenceNote?: string;
     analyzedFrameRange?: [number, number];
     totalFrames?: number;
+    entryFrameDetails?: {
+      frameIndices: number[];
+      spineAngles: number[];
+      selectionReason: string;
+    };
+    sampling?: {
+      estimatedOriginalFrames: number;
+      sampledFramesCount: number;
+      coarseSampleCount: number;
+      refinedSampleCount: number;
+      samplingStrategy: string;
+      selectedWindows: { startTime: number; endTime: number; reason: string; framesExtracted: number }[];
+      coarseFps: number;
+      refinedFps: number | null;
+      videoDuration: number;
+      coverageStartTime?: number;
+      coverageEndTime?: number;
+      coveredDurationRatio?: number;
+      extractionDiagnostics?: {
+        coarseFrameTimestamps: number[];
+        refinedFrameTimestamps: number[];
+        firstExtractedTime: number;
+        lastExtractedTime: number;
+        extractedFrameCount: number;
+        videoDuration: number;
+        durationCoverageRatio: number;
+        seekTimeouts: number;
+        coarseExtractionTimeMs: number;
+        refineExtractionTimeMs: number;
+      };
+    };
+    coverageInfo?: CoverageInfoUI;
+  };
+  // Build info (always returned)
+  buildInfo?: {
+    appVersion: string;
+    buildId: string;
+    buildTime: string;
+    evaluatorConfigVersion: string;
   };
   // Debug-only fields (returned when ?debug=true)
   ruleResultJson?: Record<string, unknown>;
@@ -107,6 +165,8 @@ function AnalyzePage() {
       .catch(() => {});
   }, []);
 
+  const [videoDuration, setVideoDuration] = useState<number>(0);
+
   const handleFileSelected = useCallback((f: File, url: string) => {
     setFile(f);
     setPreviewUrl(url);
@@ -115,6 +175,18 @@ function AnalyzePage() {
     setError(null);
     setProgress("");
     setState("idle");
+    setVideoDuration(0);
+
+    // If video, read duration for long-video warning
+    if (f.type.startsWith("video/")) {
+      const tempVideo = document.createElement("video");
+      tempVideo.preload = "metadata";
+      tempVideo.onloadedmetadata = () => {
+        setVideoDuration(tempVideo.duration);
+        URL.revokeObjectURL(tempVideo.src);
+      };
+      tempVideo.src = URL.createObjectURL(f);
+    }
   }, []);
 
   const handleAnalyze = async () => {
@@ -130,6 +202,7 @@ function AnalyzePage() {
       let frames: { timestamp: number; landmarks: Landmark[] }[] = [];
       let fps = 10;
       let duration = 0;
+      let sampling: SamplingInfo | undefined;
 
       if (isVideo) {
         // Multi-frame extraction for video
@@ -146,9 +219,29 @@ function AnalyzePage() {
         duration = video.duration;
         setProgress(`動画から骨格を抽出中... (${duration.toFixed(1)}秒)`);
 
-        frames = await extractPoseTimeSeries(video, fps, (completed, total) => {
-          setProgress(`骨格検出中: ${completed}/${total} フレーム`);
-        });
+        const technique = selectedTrick.id as TechniqueId;
+        const result = await extractPoseTimeSeries(
+          video,
+          technique,
+          30,
+          (completed, total, phase, currentTime) => {
+            const timeStr = currentTime != null ? `${currentTime.toFixed(1)}秒` : "";
+            const durationStr = duration.toFixed(1);
+            if (phase?.startsWith("refine:")) {
+              const reason = phase.replace("refine:", "");
+              const reasonJa = reason === "most_horizontal" ? "水平区間" :
+                reason === "most_vertical" ? "垂直区間" :
+                reason === "static_hold" ? "静止区間" :
+                reason === "high_movement" ? "動き区間" : reason;
+              setProgress(`重点分析中（${reasonJa}）: ${completed}/${total}フレーム`);
+            } else {
+              setProgress(`全体走査中: ${completed}/${total}フレーム（${timeStr} / ${durationStr}秒）`);
+            }
+          }
+        );
+
+        frames = result.frames;
+        sampling = result.sampling;
 
         if (frames.length === 0) {
           throw new Error(
@@ -197,6 +290,7 @@ function AnalyzePage() {
           sourceType: isVideo ? "video" : "image",
           fps,
           duration,
+          sampling,
         }),
       });
 
@@ -282,12 +376,29 @@ function AnalyzePage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {/* Left: Upload & Controls */}
           <div className="space-y-6">
-            <VideoUploader onFileSelected={handleFileSelected} />
+            <VideoUploader
+              onFileSelected={handleFileSelected}
+              isAnalyzing={state === "detecting"}
+              analysisProgress={progress}
+            />
 
             <TrickSelector
               selectedTrickId={selectedTrick?.id || null}
               onSelect={setSelectedTrick}
             />
+
+            {/* Long video warning */}
+            {videoDuration > 15 && (
+              <div className="flex items-start gap-2 p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg text-sm text-orange-300">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p>動画が長めです（{videoDuration.toFixed(1)}秒）。</p>
+                  <p className="text-orange-400/70 text-xs mt-1">
+                    動画全体を走査しますが、長い動画では技以外の区間（待機・歩行など）がノイズとなり、最適な採点区間の選定精度が下がることがあります。技の前後3〜5秒程度にトリミングすると、より正確な分析結果が得られます。
+                  </p>
+                </div>
+              </div>
+            )}
 
             <button
               onClick={handleAnalyze}
@@ -338,22 +449,32 @@ function AnalyzePage() {
               </div>
             )}
 
-            {/* Quality Warnings */}
+            {/* Quality Warnings + Reference Analysis Notice */}
             {result?.qualityCheck && result.qualityCheck.warnings.length > 0 && (
               <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4">
                 <h3 className="text-sm font-medium text-yellow-400 mb-2 flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4" />
                   品質に関する注意
+                  {result.qualityLevel === "reference" && (
+                    <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-yellow-500/20 border border-yellow-500/40 text-yellow-300">
+                      参考分析
+                    </span>
+                  )}
                 </h3>
                 <ul className="text-sm text-yellow-300/80 space-y-1">
                   {result.qualityCheck.warnings.map((w, i) => (
                     <li key={i}>- {w}</li>
                   ))}
                 </ul>
+                {result.qualityExplanation && (
+                  <p className="mt-2 text-xs text-yellow-400/70 border-t border-yellow-500/20 pt-2">
+                    {result.qualityExplanation}
+                  </p>
+                )}
               </div>
             )}
 
-            {/* Evaluation Mode Banner */}
+            {/* Evaluation Mode Banner — shown when evaluationMode is set */}
             {result?.meta?.evaluationMode && (
               <div className={`rounded-xl p-4 border ${
                 result.meta.evaluationMode === "entry"
@@ -373,16 +494,117 @@ function AnalyzePage() {
                       (静止保持: {result.meta.holdDuration.toFixed(1)}秒)
                     </span>
                   )}
-                  {result.meta.analyzedFrameRange && (
-                    <span className="text-xs text-gray-600 font-mono">
-                      frame {result.meta.analyzedFrameRange[0]}–{result.meta.analyzedFrameRange[1]}
-                      {result.meta.totalFrames != null && ` / ${result.meta.totalFrames}`}
-                    </span>
-                  )}
                 </div>
                 {result.meta.confidenceNote && (
-                  <p className="text-xs text-gray-400">{result.meta.confidenceNote}</p>
+                  <p className="text-sm text-gray-300 mt-1">{result.meta.confidenceNote}</p>
                 )}
+              </div>
+            )}
+
+            {/* Coverage Summary — ALWAYS shown for video results (not gated by evaluationMode) */}
+            {result?.meta?.coverageInfo && (
+              <div className="rounded-xl p-4 border bg-gray-800/50 border-gray-700">
+                <h3 className="text-sm font-medium text-gray-300 mb-2">解析範囲</h3>
+                <p className="text-sm text-gray-400">
+                  {result.meta.coverageInfo.summary}
+                </p>
+                {result.meta.coverageInfo.finalScoringWindow && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    採点区間: {result.meta.coverageInfo.finalScoringWindow.startTime.toFixed(1)}〜{result.meta.coverageInfo.finalScoringWindow.endTime.toFixed(1)}秒
+                    （{result.meta.coverageInfo.finalScoringWindow.reason}）
+                  </p>
+                )}
+                {/* Sampling refinement windows */}
+                {result.meta.sampling && result.meta.sampling.selectedWindows.length > 0 && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    重点分析: {result.meta.sampling.selectedWindows.map(w => {
+                      const reasonJa = w.reason === "most_horizontal" ? "水平" :
+                        w.reason === "most_vertical" ? "垂直" :
+                        w.reason === "static_hold" ? "静止" :
+                        w.reason === "high_movement" ? "動き" : w.reason;
+                      return `${w.startTime.toFixed(1)}〜${w.endTime.toFixed(1)}秒（${reasonJa}, ${w.framesExtracted}フレーム）`;
+                    }).join("、")}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Debug: Diagnostic Checkpoint — single screenshot-friendly panel */}
+            {isDebugMode && result?.meta && (
+              <div className="rounded-xl p-4 border bg-purple-500/5 border-purple-500/30">
+                <h3 className="text-sm font-medium text-purple-400 mb-2 flex items-center gap-2">
+                  <Bug className="w-4 h-4" />
+                  診断チェックポイント
+                </h3>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] font-mono text-gray-400">
+                  <div>client: {process.env.NEXT_PUBLIC_BUILD_ID ?? "?"}</div>
+                  <div>server: {result.buildInfo?.buildId ?? "?"}</div>
+                  <div>app: v{result.buildInfo?.appVersion ?? process.env.NEXT_PUBLIC_APP_VERSION ?? "?"}</div>
+                  <div>eval: v{result.buildInfo?.evaluatorConfigVersion ?? "?"}</div>
+                  <div>strategy: {result.meta.sampling?.samplingStrategy ?? "n/a"}</div>
+                  <div>evalMode: {result.meta.evaluationMode ?? "none"}</div>
+                  {result.meta.coverageInfo && (
+                    <>
+                      <div>scan: {result.meta.coverageInfo.coarseScanTimeRange[0].toFixed(1)}-{result.meta.coverageInfo.coarseScanTimeRange[1].toFixed(1)}s</div>
+                      <div>score: {result.meta.coverageInfo.finalScoringWindow?.startTime.toFixed(1)}-{result.meta.coverageInfo.finalScoringWindow?.endTime.toFixed(1)}s</div>
+                    </>
+                  )}
+                  {result.meta.sampling && (
+                    <>
+                      <div>coarse: {result.meta.sampling.coarseSampleCount}f</div>
+                      <div>refined: {result.meta.sampling.refinedSampleCount}f</div>
+                      <div>total: {result.meta.sampling.sampledFramesCount}f</div>
+                      <div>vidDur: {result.meta.sampling.videoDuration?.toFixed(1)}s</div>
+                    </>
+                  )}
+                  {result.meta.sampling?.extractionDiagnostics && (() => {
+                    const d = result.meta.sampling.extractionDiagnostics!;
+                    return (
+                      <>
+                        <div>firstTime: {d.firstExtractedTime.toFixed(2)}s</div>
+                        <div>lastTime: {d.lastExtractedTime.toFixed(2)}s</div>
+                        <div className={d.durationCoverageRatio < 0.9 ? "text-red-400 font-bold" : "text-green-400"}>
+                          coverage: {(d.durationCoverageRatio * 100).toFixed(1)}%
+                        </div>
+                        <div>seekFail: {d.seekTimeouts}</div>
+                        <div>extractMs: {d.coarseExtractionTimeMs + d.refineExtractionTimeMs}ms</div>
+                        <div>frames: {d.extractedFrameCount}</div>
+                      </>
+                    );
+                  })()}
+                  <div>range: [{result.meta.analyzedFrameRange?.join("-")}]</div>
+                  <div>totalF: {result.meta.totalFrames}</div>
+                </div>
+                {/* Entry frame details */}
+                {result.meta.entryFrameDetails && (
+                  <div className="mt-2 text-[10px] text-gray-500 font-mono border-t border-gray-700/50 pt-2">
+                    <div>{result.meta.entryFrameDetails.selectionReason}</div>
+                    <div>frames: [{result.meta.entryFrameDetails.frameIndices.join(", ")}]</div>
+                    <div>spine: [{result.meta.entryFrameDetails.spineAngles.join("°, ")}°]</div>
+                  </div>
+                )}
+                {/* Coverage phases */}
+                {result.meta.coverageInfo && (
+                  <div className="mt-2 text-[10px] text-gray-500 font-mono border-t border-gray-700/50 pt-2">
+                    {result.meta.coverageInfo.analysisPhases.map((p, i) => (
+                      <div key={i}>
+                        [{p.phase}] {p.description} ({p.timeRange[0].toFixed(1)}-{p.timeRange[1].toFixed(1)}s, {p.frameCount}f)
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* Extraction diagnostics: timestamps */}
+                {result.meta.sampling?.extractionDiagnostics && (() => {
+                  const d = result.meta.sampling.extractionDiagnostics!;
+                  return d.coarseFrameTimestamps.length > 0 ? (
+                    <div className="mt-2 text-[10px] text-gray-500 font-mono border-t border-gray-700/50 pt-2">
+                      <div>coarseTs ({d.coarseFrameTimestamps.length}): [{d.coarseFrameTimestamps.slice(0, 5).map(t => t.toFixed(2)).join(", ")}{d.coarseFrameTimestamps.length > 5 ? `, ... , ${d.coarseFrameTimestamps[d.coarseFrameTimestamps.length - 1].toFixed(2)}` : ""}]</div>
+                      {d.refinedFrameTimestamps.length > 0 && (
+                        <div>refineTs ({d.refinedFrameTimestamps.length}): [{d.refinedFrameTimestamps.slice(0, 5).map(t => t.toFixed(2)).join(", ")}{d.refinedFrameTimestamps.length > 5 ? `, ...` : ""}]</div>
+                      )}
+                    </div>
+                  ) : null;
+                })()}
               </div>
             )}
 
@@ -429,7 +651,11 @@ function AnalyzePage() {
             {/* Score & Advice */}
             {result && (
               <>
-                <ScoreCard result={result} />
+                <ScoreCard
+                  result={result}
+                  qualityLevel={result.qualityLevel}
+                  confidenceNote={result.meta?.confidenceNote}
+                />
                 <AdvicePanel result={result} />
 
                 {/* Debug: Violation Details */}
@@ -535,6 +761,19 @@ function AnalyzePage() {
             )}
           </div>
         )}
+
+        {/* Build Info Footer */}
+        <div className={`mt-8 pb-4 text-center ${isDebugMode ? "text-[11px] text-purple-400/60" : "text-[10px] text-gray-600"}`}>
+          <span>v{process.env.NEXT_PUBLIC_APP_VERSION ?? "?"}</span>
+          <span className="mx-1">·</span>
+          <span>{process.env.NEXT_PUBLIC_BUILD_ID ?? "dev"}</span>
+          {isDebugMode && (
+            <>
+              <span className="mx-1">·</span>
+              <span>{process.env.NEXT_PUBLIC_BUILD_TIME ?? "local"}</span>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

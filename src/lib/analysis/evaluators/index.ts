@@ -3,15 +3,19 @@ import {
   FeatureSet,
   EvaluationResult,
   TechniqueId,
+  SamplingInfo,
 } from "../types";
 import { evaluateHandstand } from "./handstand";
 import { evaluatePlanche } from "./planche";
 import { evaluateSwipes } from "./swipes";
 
-const EVALUATORS: Record<
-  TechniqueId,
-  (series: NormalizedTimeSeries, features: FeatureSet) => EvaluationResult
-> = {
+type EvaluatorFn = (
+  series: NormalizedTimeSeries,
+  features: FeatureSet,
+  sampling?: SamplingInfo,
+) => EvaluationResult;
+
+const EVALUATORS: Record<TechniqueId, EvaluatorFn> = {
   handstand: evaluateHandstand,
   planche: evaluatePlanche,
   swipes: evaluateSwipes,
@@ -20,11 +24,12 @@ const EVALUATORS: Record<
 export function evaluate(
   technique: TechniqueId,
   series: NormalizedTimeSeries,
-  features: FeatureSet
+  features: FeatureSet,
+  sampling?: SamplingInfo
 ): EvaluationResult {
   const evaluator = EVALUATORS[technique];
   if (!evaluator) {
     throw new Error(`Unknown technique: ${technique}`);
   }
-  return evaluator(series, features);
+  return evaluator(series, features, sampling);
 }

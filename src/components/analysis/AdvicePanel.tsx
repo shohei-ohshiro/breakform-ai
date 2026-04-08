@@ -45,6 +45,13 @@ const PRIORITY_COLORS = {
 
 export default function AdvicePanel({ result }: AdvicePanelProps) {
   const [expandedIssue, setExpandedIssue] = useState<number | null>(0);
+  const [showAllIssues, setShowAllIssues] = useState(false);
+
+  const MAX_VISIBLE_ISSUES = 3;
+  const visibleIssues = showAllIssues
+    ? result.issues
+    : result.issues.slice(0, MAX_VISIBLE_ISSUES);
+  const hiddenCount = result.issues.length - MAX_VISIBLE_ISSUES;
 
   return (
     <div className="space-y-6">
@@ -53,10 +60,15 @@ export default function AdvicePanel({ result }: AdvicePanelProps) {
         <h3 className="text-lg font-semibold text-gray-200 mb-4 flex items-center gap-2">
           <AlertTriangle className="w-5 h-5 text-yellow-400" />
           改善ポイント
+          {result.issues.length > 0 && (
+            <span className="text-xs text-gray-500 font-normal">
+              ({Math.min(result.issues.length, MAX_VISIBLE_ISSUES)}/{result.issues.length}件)
+            </span>
+          )}
         </h3>
 
         <div className="space-y-3">
-          {result.issues.map((issue, index) => (
+          {visibleIssues.map((issue, index) => (
             <div
               key={index}
               className="border border-gray-700 rounded-lg overflow-hidden"
@@ -110,6 +122,14 @@ export default function AdvicePanel({ result }: AdvicePanelProps) {
               )}
             </div>
           ))}
+          {!showAllIssues && hiddenCount > 0 && (
+            <button
+              onClick={() => setShowAllIssues(true)}
+              className="w-full text-center text-sm text-gray-500 hover:text-gray-400 py-2"
+            >
+              他 {hiddenCount} 件を表示
+            </button>
+          )}
         </div>
       </div>
 

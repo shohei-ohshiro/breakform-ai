@@ -124,7 +124,7 @@ describe("PlancheEvaluator", () => {
     const result = evaluate("planche", normalized, features);
 
     expect(result.meta).toBeDefined();
-    expect(result.meta.configVersion).toBe("2.1");
+    expect(result.meta.configVersion).toBe("2.3");
     expect(result.meta.evaluationMode).toBe("hold"); // image → always hold
   });
 

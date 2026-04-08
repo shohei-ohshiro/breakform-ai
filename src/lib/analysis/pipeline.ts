@@ -28,6 +28,9 @@ import {
   PipelineInput,
   PipelineResult,
   PoseTimeSeries,
+  QualityCheckResult,
+  QualityLevel,
+  SamplingInfo,
   featureSetToJSON,
   FeatureSetJSON,
 } from "./types";
@@ -59,6 +62,7 @@ export async function runPipeline(
 
   // If quality is too low AND not even reference-analyzable, return early
   if (!qualityCheck.passed && !qualityCheck.analyzableAsReference) {
+    const qLevel = computeQualityLevel(qualityCheck);
     return {
       score: 0,
       issues: [
@@ -97,6 +101,8 @@ export async function runPipeline(
       },
       viewpoint,
       finalScore: 0,
+      qualityLevel: qLevel,
+      qualityExplanation: computeQualityExplanation(qualityCheck, qLevel),
     };
   }
 
@@ -106,8 +112,17 @@ export async function runPipeline(
   // 4. Extract features
   const features = extractFeatures(normalized);
 
-  // 5. Evaluate
-  const evaluation = evaluate(input.technique, normalized, features);
+  // 5. Evaluate (pass sampling so evaluators can include coverage info)
+  const evaluation = evaluate(input.technique, normalized, features, input.sampling);
+
+  // 5b. Attach sampling metadata if available
+  if (input.sampling) {
+    evaluation.meta.sampling = input.sampling;
+    // Update coverageInfo with sampling refinement phases
+    if (evaluation.meta.coverageInfo && input.sampling.selectedWindows.length > 0) {
+      evaluation.meta.coverageInfo.summary = evaluation.meta.coverageInfo.summary;
+    }
+  }
 
   // 6. Generate advice
   let generatedAdvice;
@@ -124,6 +139,8 @@ export async function runPipeline(
     generatedAdvice = buildFallbackAdvice(evaluation);
   }
 
+  const qualityLevel = computeQualityLevel(qualityCheck);
+
   return {
     score: evaluation.finalScore,
     issues: generatedAdvice.issues,
@@ -135,7 +152,30 @@ export async function runPipeline(
     ruleResultJson: evaluation,
     viewpoint,
     finalScore: evaluation.finalScore,
+    qualityLevel,
+    qualityExplanation: computeQualityExplanation(qualityCheck, qualityLevel),
   };
+}
+
+/**
+ * Compute a 3-level quality classification for UI display.
+ * - "good": quality passed, few warnings
+ * - "reference": borderline quality, results should be treated as reference
+ * - "retry": quality too low, re-record recommended
+ */
+function computeQualityLevel(quality: QualityCheckResult): QualityLevel {
+  if (quality.passed && quality.warnings.length <= 1) return "good";
+  if (quality.passed) return "good"; // passed but with warnings is still "good"
+  if (quality.analyzableAsReference) return "reference";
+  return "retry";
+}
+
+function computeQualityExplanation(quality: QualityCheckResult, level: QualityLevel): string {
+  if (level === "good") return "";
+  if (level === "reference") {
+    return "品質に注意点がありますが、参考分析として採点しました。数値は目安としてご活用ください。";
+  }
+  return "分析に十分な品質のデータが得られませんでした。再撮影をおすすめします。";
 }
 
 function emptyFeatureJson(): FeatureSetJSON {

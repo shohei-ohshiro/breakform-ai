@@ -7,15 +7,38 @@ import {
   RuleViolation,
   TechniqueEvent,
   StaticInterval,
+  SamplingInfo,
   LM,
 } from "../types";
 import { PLANCHE_CONFIG as C } from "../config";
 import { STABILITY_THRESHOLDS } from "../config";
-import { classify, sev, avg, scoreFromDeviation, computeScoreImpact, rankViolations } from "./utils";
+import { classify, sev, avg, scoreFromDeviation, computeScoreImpact, rankViolations, buildCoverageInfo } from "./utils";
 
-const CONFIG_VERSION = "2.1";
+const CONFIG_VERSION = "2.3";
 
 type EvalMode = "hold" | "entry";
+
+// ---- Entry-mode display labels ----
+const ENTRY_LABELS: Record<string, string> = {
+  hip_sag: "下半身の追従",
+  // Others keep the same label for both modes
+};
+
+// ---- Entry-mode breakdown labels (category → label) ----
+function getLabel(category: string, mode: EvalMode): string {
+  const defaults: Record<string, string> = {
+    shoulder_lean: "肩の前傾",
+    body_line: "体幹ライン",
+    hip_sag: "骨盤の落ち",
+    elbow_lockout: "肘の伸展",
+    stability: "安定性",
+    entry_quality: "進入フォーム",
+  };
+  if (mode === "entry" && category in ENTRY_LABELS) {
+    return ENTRY_LABELS[category];
+  }
+  return defaults[category] ?? category;
+}
 
 interface ModeClassification {
   mode: EvalMode;
@@ -27,6 +50,8 @@ interface ModeClassification {
   holdDuration: number;
   holdRatio: number;
   confidenceNote: string;
+  /** Debug: entry frame selection details */
+  entryFrameDetails?: EntryFrameSelection["details"];
 }
 
 /**
@@ -85,7 +110,8 @@ function classifyMode(
 
   // No sufficient static interval → entry mode
   // Find the "best frame" = frame where body is most horizontal (spine angle closest to 90°)
-  const bestFrames = findBestEntryFrames(series, features);
+  const entrySelection = findBestEntryFrames(series, features);
+  const bestFrames = entrySelection.frames;
   const startIdx = bestFrames.length > 0 ? series.frames.indexOf(bestFrames[0]) : 0;
   const endIdx = bestFrames.length > 0 ? series.frames.indexOf(bestFrames[bestFrames.length - 1]) : series.frames.length - 1;
 
@@ -100,38 +126,113 @@ function classifyMode(
     confidenceNote: holdDuration > 0
       ? `静止保持が${holdDuration.toFixed(1)}秒（基準: ${C.holdDetection.minHoldDuration}秒以上）のため進入フォーム評価として採点。`
       : "静止保持が検出されなかったため、進入フォーム評価として採点。最も水平に近いフレームを使用。",
+    entryFrameDetails: entrySelection.details,
   };
+}
+
+interface EntryFrameSelection {
+  frames: NormalizedFrame[];
+  details: {
+    frameIndices: number[];
+    spineAngles: number[];
+    selectionReason: string;
+  };
+}
+
+/** Key landmarks that must be visible for a reliable planche evaluation */
+const PLANCHE_KEY_LANDMARKS = [
+  LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER,
+  LM.LEFT_WRIST, LM.RIGHT_WRIST,
+  LM.LEFT_HIP, LM.RIGHT_HIP,
+  LM.LEFT_ANKLE, LM.RIGHT_ANKLE,
+];
+
+/**
+ * Compute a skeleton quality score (0-1) for a normalized frame.
+ * Factors in visibility of key landmarks for planche evaluation.
+ */
+function frameSkeletonQuality(frame: NormalizedFrame): number {
+  let totalVis = 0;
+  let count = 0;
+  for (const idx of PLANCHE_KEY_LANDMARKS) {
+    if (idx < frame.landmarks.length) {
+      totalVis += frame.landmarks[idx].visibility;
+      count++;
+    }
+  }
+  return count > 0 ? totalVis / count : 0;
 }
 
 /**
  * For entry mode: find frames where the body is closest to horizontal (planche position).
- * Returns top N frames sorted by timestamp.
+ * Factors in spine angle closeness to 90°, skeleton visibility, and
+ * shoulder-hip-ankle alignment to avoid selecting frames with missing bones.
+ *
+ * Returns top N frames sorted by timestamp, plus selection details for debug.
  */
 function findBestEntryFrames(
   series: NormalizedTimeSeries,
   features: FeatureSet
-): NormalizedFrame[] {
-  if (series.frames.length === 0) return [];
+): EntryFrameSelection {
+  if (series.frames.length === 0) {
+    return { frames: [], details: { frameIndices: [], spineAngles: [], selectionReason: "フレームなし" } };
+  }
 
-  // Score each frame by how close spine angle is to 90° (horizontal)
-  const scored = features.angles.map((a, i) => ({
-    index: i,
-    horizontalDev: Math.abs(a.spineAngle - 90),
-  }));
+  // Score each frame: lower = better candidate
+  // Composite score = horizontalDev * (1 + visibilityPenalty)
+  const scored = features.angles.map((a, i) => {
+    const frame = series.frames[i];
+    const horizontalDev = Math.abs(a.spineAngle - 90);
+    const skelQuality = frameSkeletonQuality(frame);
 
-  // Sort by closeness to horizontal
-  scored.sort((a, b) => a.horizontalDev - b.horizontalDev);
+    // Penalty for low visibility (0 = perfect, up to 2x penalty for very poor)
+    const visPenalty = skelQuality >= 0.7 ? 0 : (0.7 - skelQuality) * 3;
 
-  // Take up to 5 best frames
-  const bestIndices = scored.slice(0, Math.min(5, scored.length)).map(s => s.index);
+    // Bonus: how well aligned are shoulder-hip-ankle in Y (body straightness)
+    const lm = frame.landmarks;
+    const sY = (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y) / 2;
+    const hY = (lm[LM.LEFT_HIP].y + lm[LM.RIGHT_HIP].y) / 2;
+    const aY = (lm[LM.LEFT_ANKLE].y + lm[LM.RIGHT_ANKLE].y) / 2;
+    const ySpread = Math.max(sY, hY, aY) - Math.min(sY, hY, aY);
+    // ySpread near 0 = very horizontal, add a small penalty for spread
+    const spreadPenalty = ySpread * 10;
+
+    return {
+      index: i,
+      spineAngle: a.spineAngle,
+      horizontalDev,
+      skelQuality,
+      compositeScore: horizontalDev * (1 + visPenalty) + spreadPenalty,
+    };
+  });
+
+  // Sort by composite score (lower is better)
+  scored.sort((a, b) => a.compositeScore - b.compositeScore);
+
+  // Take up to 5 best frames, but reject any with very poor skeleton quality
+  const MIN_SKEL_QUALITY = 0.3;
+  const candidates = scored.filter(s => s.skelQuality >= MIN_SKEL_QUALITY);
+  const best = (candidates.length > 0 ? candidates : scored).slice(0, Math.min(5, scored.length));
+  const bestIndices = best.map(s => s.index);
   bestIndices.sort((a, b) => a - b); // restore time order
 
-  return bestIndices.map(i => series.frames[i]);
+  const sortedBest = bestIndices.map(idx => best.find(b => b.index === idx)!);
+  const topCandidate = scored[0];
+
+  return {
+    frames: bestIndices.map(i => series.frames[i]),
+    details: {
+      frameIndices: bestIndices,
+      spineAngles: sortedBest.map(b => Math.round(b.spineAngle * 10) / 10),
+      selectionReason: `体幹角度+骨格品質の複合スコアで${bestIndices.length}フレームを選択（最小偏差: ${topCandidate.horizontalDev.toFixed(1)}°, 骨格品質: ${(topCandidate.skelQuality * 100).toFixed(0)}%）`,
+    },
+  };
 }
 
 export function evaluatePlanche(
   series: NormalizedTimeSeries,
-  features: FeatureSet
+  features: FeatureSet,
+  sampling?: SamplingInfo
 ): EvaluationResult {
   const violations: RuleViolation[] = [];
   const events: TechniqueEvent[] = [];
@@ -226,22 +327,30 @@ export function evaluatePlanche(
 
   const spineStatus = classify(actualSpineDev, C.bodyLine.spineDeviation.warn, C.bodyLine.spineDeviation.fail);
   if (spineStatus !== "pass") {
+    const spineMsg = mode.mode === "entry"
+      ? `進入時の体幹が水平から${actualSpineDev.toFixed(1)}°傾いている`
+      : `体幹ラインが水平から${actualSpineDev.toFixed(1)}°ずれている`;
     violations.push({
       ruleId: "planche_body_line", severity: sev(spineStatus), status: spineStatus,
-      bodyPart: "体幹", message: `体幹ラインが水平から${actualSpineDev.toFixed(1)}°ずれている`,
+      bodyPart: "体幹", message: spineMsg,
       actual: avgSpine, ideal: 90,
       threshold: { warn: C.bodyLine.spineDeviation.warn, fail: C.bodyLine.spineDeviation.fail },
       deviation: actualSpineDev, unit: "deg", confidence, context: { frameRange },
       scoreImpact: computeScoreImpact(actualSpineDev, C.bodyLine.spineDeductionPerDeg, bodyLineWeight, sev(spineStatus)),
     });
-    suggestions.push("肩から足首まで一直線を保つことが重要です。ホローボディホールドで体幹を鍛えましょう。");
+    suggestions.push(mode.mode === "entry"
+      ? "進入時にもう少し体を前に倒して水平に近づけましょう。タックプランシェでの前傾練習が効果的です。"
+      : "肩から足首まで一直線を保つことが重要です。ホローボディホールドで体幹を鍛えましょう。");
   }
 
   const yStatus = classify(avgYRange, C.bodyLine.yRangeDeviation.warn, C.bodyLine.yRangeDeviation.fail);
   if (yStatus !== "pass") {
+    const yMsg = mode.mode === "entry"
+      ? "進入中の全身ラインがまだ揃っていない"
+      : "肩・骨盤・足首のラインが崩れている";
     violations.push({
       ruleId: "planche_body_not_straight", severity: sev(yStatus), status: yStatus,
-      bodyPart: "全身", message: "肩・骨盤・足首のラインが崩れている",
+      bodyPart: "全身", message: yMsg,
       actual: avgYRange, ideal: 0,
       threshold: { warn: C.bodyLine.yRangeDeviation.warn, fail: C.bodyLine.yRangeDeviation.fail },
       deviation: avgYRange, unit: "ratio", confidence, context: { frameRange },
@@ -273,20 +382,26 @@ export function evaluatePlanche(
 
   const sagStatus = classify(avgSag, C.hipSag.sag.warn, C.hipSag.sag.fail);
   if (sagStatus !== "pass") {
+    const sagMsg = mode.mode === "entry"
+      ? `骨盤の持ち上がりが不十分（${(avgSag * 100).toFixed(0)}%）`
+      : `骨盤が${(avgSag * 100).toFixed(0)}%下がっている`;
+    const sagBodyPart = mode.mode === "entry" ? "下半身" : "骨盤";
     violations.push({
       ruleId: "planche_hip_sag", severity: sev(sagStatus), status: sagStatus,
-      bodyPart: "骨盤", message: `骨盤が${(avgSag * 100).toFixed(0)}%下がっている`,
+      bodyPart: sagBodyPart, message: sagMsg,
       actual: avgSag, ideal: 0,
       threshold: { warn: C.hipSag.sag.warn, fail: C.hipSag.sag.fail },
       deviation: avgSag, unit: "ratio", confidence, context: { frameRange },
       scoreImpact: computeScoreImpact(avgSag, C.hipSag.deductionMultiplier, hipWeight, sev(sagStatus)),
     });
-    suggestions.push("臀部を締め骨盤を後傾させましょう。プランクでの骨盤コントロール練習が有効です。");
+    suggestions.push(mode.mode === "entry"
+      ? "進入中の骨盤持ち上げは途中段階です。タックプランシェからの骨盤コントロールを意識しましょう。"
+      : "臀部を締め骨盤を後傾させましょう。プランクでの骨盤コントロール練習が有効です。");
   }
 
   const hipSagScore = scoreFromDeviation(avgSag, C.hipSag.deductionMultiplier);
   const hipSagBreakdown: ScoreBreakdown = {
-    category: "hip_sag", label: "骨盤の落ち", score: hipSagScore, weight: 0,
+    category: "hip_sag", label: getLabel("hip_sag", mode.mode), score: hipSagScore, weight: 0,
     violations: violations.filter(v => v.ruleId === "planche_hip_sag"),
     measurements: { avgSag }, frameRange,
   };
@@ -363,7 +478,7 @@ export function evaluatePlanche(
     if (bestSpineDev > C.bodyLine.spineDeviation.warn) {
       violations.push({
         ruleId: "planche_entry_incomplete", severity: "major", status: "warn",
-        bodyPart: "全身",
+        bodyPart: "進入到達度",
         message: `最も水平に近い瞬間でも${bestSpineDev.toFixed(1)}°傾いている`,
         actual: bestSpineDev, ideal: 0,
         threshold: { warn: C.bodyLine.spineDeviation.warn, fail: C.bodyLine.spineDeviation.fail },
@@ -374,14 +489,14 @@ export function evaluatePlanche(
     }
 
     entryBreakdown = {
-      category: "entry_quality", label: "進入フォーム", score: entryScore, weight: 0,
+      category: "entry_quality", label: getLabel("entry_quality", mode.mode), score: entryScore, weight: 0,
       violations: violations.filter(v => v.ruleId === "planche_entry_incomplete"),
       measurements: { bestSpineDev, progression, approachScore, progressionBonus },
       frameRange,
     };
 
     suggestions.push(
-      "進入動作の動画です。完成形を2秒以上保持する動画を撮影すると、より正確な保持評価が得られます。"
+      "進入動作としての評価です。完成形を2秒以上保持する動画を撮影すると、より正確な保持評価が得られます。"
     );
   }
 
@@ -397,6 +512,13 @@ export function evaluatePlanche(
 
   const finalScore = Math.round(breakdown.reduce((sum, b) => sum + b.score * b.weight, 0));
 
+  // Build scoring reason for coverageInfo
+  const scoringReason = mode.mode === "hold"
+    ? "静止保持区間（最長の安定区間）"
+    : "体幹角度+骨格品質の複合スコアで選定した代表フレーム";
+
+  const coverageInfo = buildCoverageInfo(series, startIdx, endIdx, scoringReason, sampling);
+
   return {
     technique: "planche", finalScore, breakdown,
     violations: rankViolations(violations),
@@ -410,6 +532,8 @@ export function evaluatePlanche(
       holdDuration: mode.holdDuration,
       holdRatio: mode.holdRatio,
       confidenceNote: mode.confidenceNote,
+      ...(mode.entryFrameDetails ? { entryFrameDetails: mode.entryFrameDetails } : {}),
+      coverageInfo,
     },
   };
 }

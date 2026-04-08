@@ -159,7 +159,7 @@ describe("Cross-technique stability", () => {
     const sw = runEval("swipes", FIXTURES.swipes.withEvents());
 
     expect(hs.meta.configVersion).toBe("2.0");
-    expect(pl.meta.configVersion).toBe("2.1");
+    expect(pl.meta.configVersion).toBe("2.3");
     expect(sw.meta.configVersion).toBe("2.0");
   });
 

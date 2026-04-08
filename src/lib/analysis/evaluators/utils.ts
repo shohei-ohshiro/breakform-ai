@@ -3,7 +3,7 @@
  * threshold classification, severity mapping, and violation ranking.
  */
 
-import { RuleStatus, RuleViolation } from "../types";
+import { RuleStatus, RuleViolation, CoverageInfo, AnalysisPhase, NormalizedTimeSeries, SamplingInfo } from "../types";
 
 // ---- Threshold classification ----
 
@@ -72,6 +72,97 @@ export function computeScoreImpact(
   const severityMultiplier = severity === "critical" ? 1.0 : severity === "major" ? 0.7 : 0.4;
   const rawLoss = Math.min(100, deviation * deductionRate);
   return Math.round(rawLoss * categoryWeight * severityMultiplier * 10) / 10;
+}
+
+// ---- Coverage info builder ----
+
+/**
+ * Build a CoverageInfo object describing what was scanned and what was scored.
+ * Called from each evaluator after determining the scoring window.
+ */
+export function buildCoverageInfo(
+  series: NormalizedTimeSeries,
+  scoringStartIdx: number,
+  scoringEndIdx: number,
+  scoringReason: string,
+  sampling?: SamplingInfo
+): CoverageInfo {
+  const duration = series.duration;
+  const scoringStartTime = series.frames[scoringStartIdx]?.timestamp ?? 0;
+  const scoringEndTime = series.frames[scoringEndIdx]?.timestamp ?? duration;
+
+  // Coarse scan always covers the full video (from first to last frame provided)
+  const firstFrameTime = series.frames[0]?.timestamp ?? 0;
+  const lastFrameTime = series.frames[series.frames.length - 1]?.timestamp ?? duration;
+
+  // Use extraction diagnostics for more accurate reporting if available
+  const diag = sampling?.extractionDiagnostics;
+  const coarseFrameCount = diag
+    ? diag.coarseFrameTimestamps.length
+    : (sampling?.coarseSampleCount ?? series.frames.length);
+  const refinedFrameCount = diag
+    ? diag.refinedFrameTimestamps.length
+    : (sampling?.refinedSampleCount ?? 0);
+
+  const phases: AnalysisPhase[] = [
+    {
+      phase: "coarse_scan",
+      description: diag
+        ? `動画全体 ${firstFrameTime.toFixed(1)}〜${lastFrameTime.toFixed(1)}秒を ${coarseFrameCount} フレームで走査`
+        : `動画全体 ${duration.toFixed(1)}秒を走査`,
+      timeRange: [firstFrameTime, lastFrameTime],
+      frameCount: coarseFrameCount,
+    },
+  ];
+
+  // Add refine phases from sampling windows
+  if (sampling && sampling.selectedWindows.length > 0) {
+    for (const w of sampling.selectedWindows) {
+      phases.push({
+        phase: "refine",
+        description: w.reason === "most_horizontal" ? "最も水平に近い区間を重点分析" :
+          w.reason === "most_vertical" ? "最も垂直に近い区間を重点分析" :
+          w.reason === "static_hold" ? "静止保持区間を重点分析" :
+          w.reason === "high_movement" ? "動きの大きい区間を重点分析" :
+          `${w.reason}区間を重点分析`,
+        timeRange: [w.startTime, w.endTime],
+        frameCount: w.framesExtracted,
+      });
+    }
+  }
+
+  phases.push({
+    phase: "scoring",
+    description: `${scoringStartTime.toFixed(1)}〜${scoringEndTime.toFixed(1)}秒を採点に使用`,
+    timeRange: [scoringStartTime, scoringEndTime],
+    frameCount: scoringEndIdx - scoringStartIdx + 1,
+  });
+
+  // Build human-readable summary with concrete time range
+  let summary: string;
+  const scanRangeStr = `${firstFrameTime.toFixed(1)}〜${lastFrameTime.toFixed(1)}秒`;
+  const scoringRangeStr = `${scoringStartTime.toFixed(1)}〜${scoringEndTime.toFixed(1)}秒`;
+
+  if (sampling && sampling.selectedWindows.length > 0) {
+    const windowDescs = sampling.selectedWindows.map(w =>
+      `${w.startTime.toFixed(1)}〜${w.endTime.toFixed(1)}秒`
+    ).join("、");
+    summary = `動画全体 ${scanRangeStr} を粗い走査（${coarseFrameCount}フレーム）で確認後、${windowDescs}の区間を重点分析（${refinedFrameCount}フレーム追加）し、最終採点には ${scoringRangeStr} を使用しました`;
+  } else {
+    summary = `動画全体 ${scanRangeStr} を ${coarseFrameCount} フレームで走査し、${scoringRangeStr} を採点に使用しました`;
+  }
+
+  return {
+    fullScanPerformed: true,
+    coarseScanTimeRange: [firstFrameTime, lastFrameTime],
+    finalScoringWindow: {
+      startTime: scoringStartTime,
+      endTime: scoringEndTime,
+      reason: scoringReason,
+    },
+    analysisPhases: phases,
+    summary,
+  };
 }
 
 /**

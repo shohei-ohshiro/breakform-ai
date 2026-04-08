@@ -5,17 +5,19 @@ import {
   ScoreBreakdown,
   RuleViolation,
   TechniqueEvent,
+  SamplingInfo,
   LM,
 } from "../types";
 import { HANDSTAND_CONFIG as C } from "../config";
 import { STABILITY_THRESHOLDS, SYMMETRY_THRESHOLDS } from "../config";
-import { classify, sev, avg, scoreFromDeviation, computeScoreImpact, rankViolations } from "./utils";
+import { classify, sev, avg, scoreFromDeviation, computeScoreImpact, rankViolations, buildCoverageInfo } from "./utils";
 
 const CONFIG_VERSION = "2.0";
 
 export function evaluateHandstand(
   series: NormalizedTimeSeries,
-  features: FeatureSet
+  features: FeatureSet,
+  sampling?: SamplingInfo
 ): EvaluationResult {
   const violations: RuleViolation[] = [];
   const events: TechniqueEvent[] = [];
@@ -294,6 +296,11 @@ export function evaluateHandstand(
 
   const finalScore = Math.round(breakdown.reduce((sum, b) => sum + b.score * b.weight, 0));
 
+  const scoringReason = interval
+    ? "静止保持区間（最長の安定区間）"
+    : "全フレームを使用";
+  const coverageInfo = buildCoverageInfo(series, startIdx, endIdx, scoringReason, sampling);
+
   return {
     technique: "handstand",
     finalScore,
@@ -306,6 +313,12 @@ export function evaluateHandstand(
       staticIntervalUsed: interval ?? null,
       totalFrames: series.frames.length,
       configVersion: CONFIG_VERSION,
+      evaluationMode: "hold" as const,
+      holdDuration: interval ? interval.endTime - interval.startTime : 0,
+      holdRatio: interval
+        ? (interval.endTime - interval.startTime) / (series.duration || 1)
+        : 0,
+      coverageInfo,
     },
   };
 }

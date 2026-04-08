@@ -6,10 +6,11 @@ import {
   RuleViolation,
   RuleStatus,
   TechniqueEvent,
+  SamplingInfo,
   LM,
 } from "../types";
 import { SWIPES_CONFIG as C } from "../config";
-import { classify, sev, rankViolations } from "./utils";
+import { classify, sev, rankViolations, buildCoverageInfo } from "./utils";
 
 const CONFIG_VERSION = "2.0";
 
@@ -24,7 +25,8 @@ const CONFIG_VERSION = "2.0";
  */
 export function evaluateSwipes(
   series: NormalizedTimeSeries,
-  features: FeatureSet
+  features: FeatureSet,
+  sampling?: SamplingInfo
 ): EvaluationResult {
   const violations: RuleViolation[] = [];
   const suggestions: string[] = [];
@@ -113,6 +115,12 @@ export function evaluateSwipes(
     breakdown.reduce((sum, b) => sum + b.score * b.weight, 0)
   );
 
+  const coverageInfo = buildCoverageInfo(
+    series, 0, series.frames.length - 1,
+    "動作系技のため全フレームを使用",
+    sampling
+  );
+
   return {
     technique: "swipes",
     finalScore,
@@ -125,6 +133,8 @@ export function evaluateSwipes(
       staticIntervalUsed: null,
       totalFrames: series.frames.length,
       configVersion: CONFIG_VERSION,
+      evaluationMode: "hold" as const,
+      coverageInfo,
     },
   };
 }

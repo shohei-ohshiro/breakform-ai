@@ -204,6 +204,105 @@ export function featureSetToJSON(fs: FeatureSet): FeatureSetJSON {
 }
 
 // ============================================
+// Sampling Strategy
+// ============================================
+
+/** A time window identified for high-density re-sampling */
+export interface SamplingWindow {
+  startTime: number;
+  endTime: number;
+  reason: string; // e.g. "most_horizontal", "static_hold", "high_movement"
+  framesExtracted: number;
+}
+
+/** Metadata about how frames were sampled from the source video */
+export interface SamplingInfo {
+  /** Estimated total frames in the original video (duration × native fps) */
+  estimatedOriginalFrames: number;
+  /** Total frames sent to the pipeline (coarse + refined) */
+  sampledFramesCount: number;
+  /** Number of frames from Phase A (coarse, full-video scan) */
+  coarseSampleCount: number;
+  /** Number of frames from Phase B (refined, targeted re-extraction) */
+  refinedSampleCount: number;
+  /** Strategy name for display */
+  samplingStrategy: "uniform" | "adaptive_two_phase" | "full_scan_then_refine";
+  /** Windows that were re-sampled at higher density in Phase B */
+  selectedWindows: SamplingWindow[];
+  /** Coarse sampling FPS used in Phase A */
+  coarseFps: number;
+  /** Refined sampling FPS used in Phase B (null if no refinement) */
+  refinedFps: number | null;
+  /** Video duration in seconds */
+  videoDuration: number;
+  /** Start time of coarse scan coverage (always 0 for full scan) */
+  coverageStartTime: number;
+  /** End time of coarse scan coverage (= videoDuration for full scan) */
+  coverageEndTime: number;
+  /** Ratio of video duration covered by coarse scan (1.0 = full video) */
+  coveredDurationRatio: number;
+  /** Extraction diagnostics (populated by client-side extraction) */
+  extractionDiagnostics?: ExtractionDiagnostics;
+}
+
+/**
+ * Diagnostics from the client-side frame extraction process.
+ * Provides verifiable evidence of what was actually extracted.
+ */
+export interface ExtractionDiagnostics {
+  /** All timestamps (seconds) from Phase A coarse scan */
+  coarseFrameTimestamps: number[];
+  /** All timestamps (seconds) from Phase B refinement */
+  refinedFrameTimestamps: number[];
+  /** Earliest extracted frame timestamp */
+  firstExtractedTime: number;
+  /** Latest extracted frame timestamp */
+  lastExtractedTime: number;
+  /** Total successfully extracted frames */
+  extractedFrameCount: number;
+  /** HTMLVideoElement.duration as reported by the browser */
+  videoDuration: number;
+  /** lastExtractedTime / videoDuration — should be close to 1.0 */
+  durationCoverageRatio: number;
+  /** Number of seek operations that timed out */
+  seekTimeouts: number;
+  /** Wall-clock time for Phase A extraction (ms) */
+  coarseExtractionTimeMs: number;
+  /** Wall-clock time for Phase B extraction (ms) */
+  refineExtractionTimeMs: number;
+}
+
+// ============================================
+// Coverage Info (full-scan verification)
+// ============================================
+
+/** Description of a single analysis phase */
+export interface AnalysisPhase {
+  phase: "coarse_scan" | "refine" | "scoring";
+  description: string;
+  timeRange: [number, number]; // [startTime, endTime] in seconds
+  frameCount: number;
+}
+
+/** Coverage metadata: what was scanned vs what was scored */
+export interface CoverageInfo {
+  /** Whether the full video was scanned in the coarse pass */
+  fullScanPerformed: boolean;
+  /** Time range covered by coarse scan [startTime, endTime] */
+  coarseScanTimeRange: [number, number];
+  /** The final time window used for scoring */
+  finalScoringWindow: {
+    startTime: number;
+    endTime: number;
+    reason: string;
+  };
+  /** Ordered list of analysis phases performed */
+  analysisPhases: AnalysisPhase[];
+  /** Human-readable summary for UI display */
+  summary: string;
+}
+
+// ============================================
 // Evaluation (Rule-based)
 // ============================================
 
@@ -288,6 +387,16 @@ export interface EvaluationResult {
     holdRatio?: number;
     /** Human-readable note about confidence / evaluation mode */
     confidenceNote?: string;
+    /** Debug info: why these entry frames were selected */
+    entryFrameDetails?: {
+      frameIndices: number[];
+      spineAngles: number[];
+      selectionReason: string;
+    };
+    /** Sampling strategy metadata (how frames were extracted from video) */
+    sampling?: SamplingInfo;
+    /** Coverage info: what was scanned vs what was scored */
+    coverageInfo?: CoverageInfo;
   };
 }
 
@@ -339,6 +448,13 @@ export interface GeneratedAdvice {
 }
 
 // ============================================
+// Quality Level (UI display)
+// ============================================
+
+/** 3-level quality classification for UI display */
+export type QualityLevel = "good" | "reference" | "retry";
+
+// ============================================
 // Full Pipeline Result
 // ============================================
 
@@ -349,6 +465,8 @@ export interface PipelineInput {
   fps: number;
   duration: number;
   userLevel?: "beginner" | "intermediate" | "advanced" | "expert";
+  /** Sampling metadata from client-side extraction (video only) */
+  sampling?: SamplingInfo;
 }
 
 export interface PipelineResult {
@@ -365,6 +483,10 @@ export interface PipelineResult {
   ruleResultJson: EvaluationResult;
   viewpoint: Viewpoint;
   finalScore: number;
+
+  // Quality level for UI display
+  qualityLevel: QualityLevel;
+  qualityExplanation: string;
 }
 
 // ============================================

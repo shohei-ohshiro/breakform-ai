@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { checkUsageLimit, incrementUsage } from "@/lib/usage";
 import { runPipeline } from "@/lib/analysis/pipeline";
-import { PipelineInput, TechniqueId, PoseFrame } from "@/lib/analysis/types";
+import { PipelineInput, TechniqueId, PoseFrame, SamplingInfo } from "@/lib/analysis/types";
 import { Landmark } from "@/lib/types";
 
 interface AnalyzeRequestV2 {
@@ -14,12 +14,13 @@ interface AnalyzeRequestV2 {
   fps: number;
   duration: number;
   userLevel?: "beginner" | "intermediate" | "advanced" | "expert";
+  sampling?: SamplingInfo;
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body: AnalyzeRequestV2 = await request.json();
-    const { technique, trickId, trickNameJa, frames, sourceType, fps, duration, userLevel } = body;
+    const { technique, trickId, trickNameJa, frames, sourceType, fps, duration, userLevel, sampling } = body;
 
     if (!technique || !frames || frames.length === 0) {
       return NextResponse.json(
@@ -106,6 +107,7 @@ export async function POST(request: NextRequest) {
       fps: fps || 10,
       duration: duration || 0,
       userLevel: (userLevel ?? experienceLevel ?? "beginner") as PipelineInput["userLevel"],
+      sampling: sampling ?? undefined,
     };
 
     const result = await runPipeline(pipelineInput, anthropicApiKey);
@@ -151,6 +153,29 @@ export async function POST(request: NextRequest) {
     // Return UI-compatible result
     const debugMode = new URL(request.url).searchParams.get("debug") === "true";
 
+    // For normal mode, strip large timestamp arrays from diagnostics
+    const samplingForResponse = result.ruleResultJson.meta.sampling;
+    let samplingMeta = samplingForResponse;
+    if (samplingForResponse && !debugMode && samplingForResponse.extractionDiagnostics) {
+      const { coarseFrameTimestamps, refinedFrameTimestamps, ...compactDiag } =
+        samplingForResponse.extractionDiagnostics;
+      samplingMeta = {
+        ...samplingForResponse,
+        extractionDiagnostics: {
+          ...compactDiag,
+          coarseFrameTimestamps: [],
+          refinedFrameTimestamps: [],
+        },
+      };
+    }
+
+    const buildInfo = {
+      appVersion: process.env.NEXT_PUBLIC_APP_VERSION ?? "unknown",
+      buildId: process.env.NEXT_PUBLIC_BUILD_ID ?? "dev",
+      buildTime: process.env.NEXT_PUBLIC_BUILD_TIME ?? "local",
+      evaluatorConfigVersion: result.ruleResultJson.meta.configVersion,
+    };
+
     const responseBody: Record<string, unknown> = {
       score: result.score,
       issues: result.issues,
@@ -159,6 +184,9 @@ export async function POST(request: NextRequest) {
       qualityCheck: result.qualityCheck,
       viewpoint: result.viewpoint,
       breakdown: result.ruleResultJson.breakdown,
+      qualityLevel: result.qualityLevel,
+      qualityExplanation: result.qualityExplanation,
+      buildInfo,
       meta: {
         evaluationMode: result.ruleResultJson.meta.evaluationMode,
         holdDuration: result.ruleResultJson.meta.holdDuration,
@@ -166,6 +194,9 @@ export async function POST(request: NextRequest) {
         confidenceNote: result.ruleResultJson.meta.confidenceNote,
         analyzedFrameRange: result.ruleResultJson.meta.analyzedFrameRange,
         totalFrames: result.ruleResultJson.meta.totalFrames,
+        entryFrameDetails: result.ruleResultJson.meta.entryFrameDetails,
+        sampling: samplingMeta,
+        coverageInfo: result.ruleResultJson.meta.coverageInfo,
       },
     };
 
