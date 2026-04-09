@@ -15,7 +15,7 @@ import {
   AnalysisResult,
   AnalysisState,
 } from "@/lib/types";
-import { detectPoseFromImage, extractPoseTimeSeries } from "@/lib/pose/mediapipe";
+import { detectPoseFromImage, extractPoseTimeSeries, TimestampMismatchError } from "@/lib/pose/mediapipe";
 import { TechniqueId, SamplingInfo } from "@/lib/analysis/types";
 
 const STATE_MESSAGES: Record<AnalysisState, string> = {
@@ -237,7 +237,8 @@ function AnalyzePage() {
             } else {
               setProgress(`全体走査中: ${completed}/${total}フレーム（${timeStr} / ${durationStr}秒）`);
             }
-          }
+          },
+          isDebugMode,
         );
 
         frames = result.frames;
@@ -312,7 +313,13 @@ function AnalyzePage() {
         .catch(() => {});
     } catch (err) {
       console.error("Analysis error:", err);
-      setError(err instanceof Error ? err.message : "予期せぬエラーが発生しました");
+      if (err instanceof TimestampMismatchError) {
+        // User-friendly message; diagnostics only in debug mode
+        const debugDetail = isDebugMode ? `\n\n${err.diagnostics}` : "";
+        setError(err.message + debugDetail);
+      } else {
+        setError(err instanceof Error ? err.message : "予期せぬエラーが発生しました");
+      }
       setState("error");
     }
   };

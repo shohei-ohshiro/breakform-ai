@@ -5,14 +5,15 @@ import { Landmark } from "@/lib/types";
 import { TechniqueId, SamplingInfo, SamplingWindow, ExtractionDiagnostics } from "@/lib/analysis/types";
 
 let poseLandmarkerImage: PoseLandmarker | null = null;
-let poseLandmarkerVideo: PoseLandmarker | null = null;
 let initImagePromise: Promise<PoseLandmarker> | null = null;
-let initVideoPromise: Promise<PoseLandmarker> | null = null;
 
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task";
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+
+/** Auto-incrementing ID for landmarker instances (diagnostic use) */
+let nextLandmarkerId = 1;
 
 /**
  * Initialize MediaPipe PoseLandmarker for IMAGE mode (singleton)
@@ -41,29 +42,27 @@ async function initImageLandmarker(): Promise<PoseLandmarker> {
 }
 
 /**
- * Initialize MediaPipe PoseLandmarker for VIDEO mode (singleton)
+ * Create a NEW PoseLandmarker instance for VIDEO mode.
+ * Each phase (coarse / refine) MUST use its own instance because
+ * MediaPipe VIDEO mode requires strictly monotonic timestamps.
+ * Reusing an instance across phases that seek backward causes
+ * "Packet timestamp mismatch" errors.
  */
-async function initVideoLandmarker(): Promise<PoseLandmarker> {
-  if (poseLandmarkerVideo) return poseLandmarkerVideo;
-  if (initVideoPromise) return initVideoPromise;
-
-  initVideoPromise = (async () => {
-    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
-    poseLandmarkerVideo = await PoseLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: MODEL_URL,
-        delegate: "GPU",
-      },
-      runningMode: "VIDEO",
-      numPoses: 1,
-      minPoseDetectionConfidence: 0.5,
-      minPosePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
-    return poseLandmarkerVideo;
-  })();
-
-  return initVideoPromise;
+async function createVideoLandmarker(): Promise<{ landmarker: PoseLandmarker; instanceId: number }> {
+  const instanceId = nextLandmarkerId++;
+  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+  const landmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: MODEL_URL,
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.5,
+    minPosePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  return { landmarker, instanceId };
 }
 
 function toLandmarks(
@@ -136,6 +135,93 @@ const REFINE_PADDING = 0.5;
 interface CoarseFrame {
   timestamp: number;
   landmarks: Landmark[];
+}
+
+// ============================================
+// Timestamp Monotonicity Guard
+// ============================================
+
+/**
+ * Custom error for timestamp ordering violations.
+ * Caught before MediaPipe to provide a user-friendly message
+ * while preserving full diagnostics for debug mode.
+ */
+export class TimestampMismatchError extends Error {
+  public readonly phase: string;
+  public readonly currentTimestampMs: number;
+  public readonly previousTimestampMs: number;
+  public readonly videoCurrentTime: number;
+  public readonly sampleIndex: number;
+  public readonly landmarkerInstanceId: number;
+
+  constructor(opts: {
+    phase: string;
+    currentTimestampMs: number;
+    previousTimestampMs: number;
+    videoCurrentTime: number;
+    sampleIndex: number;
+    landmarkerInstanceId: number;
+  }) {
+    super(
+      `動画解析中にフレーム時刻の不整合が発生しました。動画の再解析を行ってください。`
+    );
+    this.name = "TimestampMismatchError";
+    this.phase = opts.phase;
+    this.currentTimestampMs = opts.currentTimestampMs;
+    this.previousTimestampMs = opts.previousTimestampMs;
+    this.videoCurrentTime = opts.videoCurrentTime;
+    this.sampleIndex = opts.sampleIndex;
+    this.landmarkerInstanceId = opts.landmarkerInstanceId;
+  }
+
+  /** Detailed diagnostics string for debug mode */
+  get diagnostics(): string {
+    return [
+      `[TimestampMismatchError]`,
+      `  phase: ${this.phase}`,
+      `  landmarkerInstanceId: ${this.landmarkerInstanceId}`,
+      `  sampleIndex: ${this.sampleIndex}`,
+      `  currentTimestampMs: ${this.currentTimestampMs}`,
+      `  previousTimestampMs: ${this.previousTimestampMs}`,
+      `  videoCurrentTime: ${this.videoCurrentTime}`,
+      `  backward delta: ${this.currentTimestampMs - this.previousTimestampMs}ms`,
+    ].join("\n");
+  }
+}
+
+/** Tracks the last timestamp passed to detectForVideo for a given phase */
+export interface TimestampTracker {
+  previousTimestampMs: number;
+  sampleIndex: number;
+}
+
+export function createTimestampTracker(): TimestampTracker {
+  return { previousTimestampMs: -1, sampleIndex: 0 };
+}
+
+/**
+ * Guard: ensure timestampMs is strictly greater than previousTimestampMs.
+ * Throws TimestampMismatchError if backward seek is detected.
+ */
+export function guardTimestamp(
+  tracker: TimestampTracker,
+  timestampMs: number,
+  phase: string,
+  videoCurrentTime: number,
+  landmarkerInstanceId: number,
+): void {
+  if (timestampMs <= tracker.previousTimestampMs) {
+    throw new TimestampMismatchError({
+      phase,
+      currentTimestampMs: timestampMs,
+      previousTimestampMs: tracker.previousTimestampMs,
+      videoCurrentTime,
+      sampleIndex: tracker.sampleIndex,
+      landmarkerInstanceId,
+    });
+  }
+  tracker.previousTimestampMs = timestampMs;
+  tracker.sampleIndex++;
 }
 
 /**
@@ -342,21 +428,29 @@ interface ExtractWindowResult {
   seekTimeouts: number;
 }
 
-/** Extract frames from a specific time window at given FPS */
+/** Extract frames from a specific time window at given FPS.
+ *  The caller MUST provide a dedicated landmarker instance for this window.
+ *  Timestamps within the window are always processed in ascending order. */
 async function extractWindow(
   video: HTMLVideoElement,
   landmarker: PoseLandmarker,
+  landmarkerInstanceId: number,
   startTime: number,
   endTime: number,
   fps: number,
   existingTimestamps: Set<number>,
-  maxFrames: number
+  maxFrames: number,
+  phase: string,
+  debugLog?: (msg: string) => void,
 ): Promise<ExtractWindowResult> {
   const interval = 1 / fps;
   const frames: CoarseFrame[] = [];
   const timestamps: number[] = [];
   let seekTimeouts = 0;
   let t = startTime;
+  const tracker = createTimestampTracker();
+
+  debugLog?.(`[extractWindow] phase=${phase} instanceId=${landmarkerInstanceId} start=${startTime.toFixed(3)} end=${endTime.toFixed(3)} fps=${fps}`);
 
   while (t <= endTime && frames.length < maxFrames) {
     // Skip timestamps already covered by coarse pass (within 0.03s tolerance)
@@ -378,6 +472,10 @@ async function extractWindow(
       }
 
       const timestampMs = Math.round(t * 1000);
+      guardTimestamp(tracker, timestampMs, phase, video.currentTime, landmarkerInstanceId);
+
+      debugLog?.(`  [${phase}] idx=${tracker.sampleIndex - 1} requested=${t.toFixed(3)} actual=${video.currentTime.toFixed(3)} tsMs=${timestampMs} prevMs=${tracker.previousTimestampMs}`);
+
       const result = landmarker.detectForVideo(video, timestampMs);
 
       if (result.landmarks && result.landmarks.length > 0) {
@@ -392,6 +490,8 @@ async function extractWindow(
     t += interval;
   }
 
+  debugLog?.(`[extractWindow] phase=${phase} done: ${frames.length} frames, ${seekTimeouts} seek timeouts`);
+
   return { frames, timestamps, seekTimeouts };
 }
 
@@ -403,26 +503,35 @@ export interface ExtractionResult {
 /**
  * Extract pose time series from a video with adaptive two-phase sampling.
  *
- * Phase A: Coarse sampling across the FULL video duration.
- * Phase B: Re-extract interesting windows at higher density.
+ * Phase A: Coarse sampling across the FULL video duration (own PoseLandmarker instance).
+ * Phase B: Re-extract interesting windows at higher density (separate PoseLandmarker instance).
+ *
+ * Each phase uses a dedicated PoseLandmarker instance because MediaPipe VIDEO mode
+ * requires timestamps to be strictly monotonically increasing. Phase B windows
+ * typically start at earlier timestamps than Phase A's last timestamp.
  *
  * @param video - The HTMLVideoElement (must have metadata loaded)
  * @param technique - The technique being analyzed (affects sampling density)
  * @param nativeFps - Estimated native FPS of the video (default: 30)
  * @param onProgress - Optional callback (completedFrames, totalFrames, phase, currentTime)
+ * @param debug - Enable detailed diagnostic logging to console (default: false)
  */
 export async function extractPoseTimeSeries(
   video: HTMLVideoElement,
   technique: TechniqueId = "handstand",
   nativeFps: number = 30,
   onProgress?: (completed: number, total: number, phase?: string, currentTime?: number) => void,
+  debug: boolean = false,
 ): Promise<ExtractionResult> {
-  const landmarker = await initVideoLandmarker();
+  const debugLog = debug ? (msg: string) => console.log(`[PoseExtract] ${msg}`) : undefined;
 
   const duration = video.duration;
   const estimatedOriginalFrames = Math.round(duration * nativeFps);
 
-  // Phase A: Coarse sampling across entire video
+  // ---- Phase A: Coarse sampling across entire video (own instance) ----
+  const { landmarker: coarseLandmarker, instanceId: coarseInstanceId } = await createVideoLandmarker();
+  debugLog?.(`Phase A start: instanceId=${coarseInstanceId} duration=${duration.toFixed(3)}`);
+
   const { count: coarseCount, fps: coarseFps } = computeCoarseFrameCount(duration, technique);
   const coarseInterval = duration / coarseCount;
 
@@ -430,6 +539,7 @@ export async function extractPoseTimeSeries(
   const coarseTimestampList: number[] = [];
   let totalSeekTimeouts = 0;
   const coarseStartWall = Date.now();
+  const coarseTracker = createTimestampTracker();
 
   for (let i = 0; i < coarseCount; i++) {
     const time = i * coarseInterval;
@@ -445,7 +555,11 @@ export async function extractPoseTimeSeries(
     }
 
     const timestampMs = Math.round(time * 1000);
-    const result = landmarker.detectForVideo(video, timestampMs);
+    guardTimestamp(coarseTracker, timestampMs, "coarse", video.currentTime, coarseInstanceId);
+
+    debugLog?.(`  [coarse] idx=${i} requested=${time.toFixed(3)} actual=${video.currentTime.toFixed(3)} tsMs=${timestampMs} prevMs=${coarseTracker.previousTimestampMs}`);
+
+    const result = coarseLandmarker.detectForVideo(video, timestampMs);
 
     if (result.landmarks && result.landmarks.length > 0) {
       coarseFrames.push({
@@ -461,7 +575,11 @@ export async function extractPoseTimeSeries(
   }
   const coarseEndWall = Date.now();
 
-  // Phase B: Identify and refine interesting windows
+  // Close the coarse-phase instance — it must not be reused
+  coarseLandmarker.close();
+  debugLog?.(`Phase A end: ${coarseFrames.length} frames, ${totalSeekTimeouts} seek timeouts, lastTs=${coarseTracker.previousTimestampMs}ms. Instance ${coarseInstanceId} closed.`);
+
+  // ---- Phase B: Identify and refine interesting windows (separate instance per window) ----
   const refineWindows = findRefineWindows(coarseFrames, duration, technique);
   const existingTimestamps = new Set(
     coarseFrames.map(f => Math.round(f.timestamp * 1000))
@@ -477,19 +595,30 @@ export async function extractPoseTimeSeries(
     // Budget refinement frames across windows
     const budgetPerWindow = Math.floor(MAX_REFINE_FRAMES / refineWindows.length);
 
-    for (const window of refineWindows) {
+    // Create a single refine instance for all windows.
+    // Windows are sorted by startTime so timestamps remain monotonic within the instance.
+    const sortedWindows = [...refineWindows].sort((a, b) => a.startTime - b.startTime);
+    const { landmarker: refineLandmarker, instanceId: refineInstanceId } = await createVideoLandmarker();
+    debugLog?.(`Phase B start: instanceId=${refineInstanceId} windows=${sortedWindows.length}`);
+
+    for (const window of sortedWindows) {
       if (onProgress) {
         onProgress(0, budgetPerWindow, `refine:${window.reason}`, window.startTime);
       }
 
+      debugLog?.(`  Refine window: ${window.startTime.toFixed(3)}-${window.endTime.toFixed(3)} reason=${window.reason}`);
+
       const windowResult = await extractWindow(
         video,
-        landmarker,
+        refineLandmarker,
+        refineInstanceId,
         window.startTime,
         window.endTime,
         REFINE_FPS,
         existingTimestamps,
-        budgetPerWindow
+        budgetPerWindow,
+        `refine:${window.reason}`,
+        debugLog,
       );
 
       // Add new timestamps to existing set
@@ -511,6 +640,10 @@ export async function extractPoseTimeSeries(
         onProgress(windowResult.frames.length, budgetPerWindow, `refine:${window.reason}`, window.endTime);
       }
     }
+
+    // Close the refine-phase instance
+    refineLandmarker.close();
+    debugLog?.(`Phase B end: ${refinedTotal} frames. Instance ${refineInstanceId} closed.`);
   }
   const refineEndWall = Date.now();
 
