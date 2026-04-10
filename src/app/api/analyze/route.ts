@@ -197,6 +197,14 @@ export async function POST(request: NextRequest) {
         entryFrameDetails: result.ruleResultJson.meta.entryFrameDetails,
         sampling: samplingMeta,
         coverageInfo: result.ruleResultJson.meta.coverageInfo,
+        // Evaluation transparency fields (always returned)
+        evaluationModeReason: result.ruleResultJson.meta.evaluationModeReason,
+        selectedEvaluationWindow: result.ruleResultJson.meta.selectedEvaluationWindow,
+        selectedReason: result.ruleResultJson.meta.selectedReason,
+        candidateWindowsTopN: result.ruleResultJson.meta.candidateWindowsTopN,
+        qualityImpactSummary: result.ruleResultJson.meta.qualityImpactSummary,
+        cycleSummary: result.ruleResultJson.meta.cycleSummary,
+        eventSummary: result.ruleResultJson.meta.eventSummary,
       },
     };
 

@@ -8,13 +8,16 @@ import {
   TechniqueEvent,
   StaticInterval,
   SamplingInfo,
+  CandidateWindow,
+  QualityImpactSummary,
+  QualityImpact,
   LM,
 } from "../types";
 import { PLANCHE_CONFIG as C } from "../config";
 import { STABILITY_THRESHOLDS } from "../config";
 import { classify, sev, avg, scoreFromDeviation, computeScoreImpact, rankViolations, buildCoverageInfo } from "./utils";
 
-const CONFIG_VERSION = "2.3";
+const CONFIG_VERSION = "2.4";
 
 type EvalMode = "hold" | "entry";
 
@@ -50,8 +53,12 @@ interface ModeClassification {
   holdDuration: number;
   holdRatio: number;
   confidenceNote: string;
+  /** Human-readable reason for the mode classification */
+  evaluationModeReason: string;
   /** Debug: entry frame selection details */
   entryFrameDetails?: EntryFrameSelection["details"];
+  /** Top-N candidate windows considered */
+  candidateWindowsTopN?: CandidateWindow[];
 }
 
 /**
@@ -85,6 +92,7 @@ function classifyMode(
       holdDuration: 0,
       holdRatio: 1,
       confidenceNote: "静止画からの評価",
+      evaluationModeReason: "静止画のため、保持評価として採点しました。",
     };
   }
 
@@ -105,15 +113,19 @@ function classifyMode(
       holdDuration,
       holdRatio,
       confidenceNote: note,
+      evaluationModeReason: `${holdDuration.toFixed(1)}秒の静止保持が検出されたため（基準: ${C.holdDetection.minHoldDuration}秒以上）、保持評価として採点しました。`,
     };
   }
 
   // No sufficient static interval → entry mode
-  // Find the "best frame" = frame where body is most horizontal (spine angle closest to 90°)
   const entrySelection = findBestEntryFrames(series, features);
   const bestFrames = entrySelection.frames;
   const startIdx = bestFrames.length > 0 ? series.frames.indexOf(bestFrames[0]) : 0;
   const endIdx = bestFrames.length > 0 ? series.frames.indexOf(bestFrames[bestFrames.length - 1]) : series.frames.length - 1;
+
+  const modeReason = holdDuration > 0
+    ? `静止保持が${holdDuration.toFixed(1)}秒（基準: ${C.holdDetection.minHoldDuration}秒以上）のため、進入フォーム評価として採点しました。`
+    : `${C.holdDetection.minHoldDuration}秒以上の静止保持が検出されなかったため、進入フォーム評価として採点しました。`;
 
   return {
     mode: "entry",
@@ -126,7 +138,9 @@ function classifyMode(
     confidenceNote: holdDuration > 0
       ? `静止保持が${holdDuration.toFixed(1)}秒（基準: ${C.holdDetection.minHoldDuration}秒以上）のため進入フォーム評価として採点。`
       : "静止保持が検出されなかったため、進入フォーム評価として採点。最も水平に近いフレームを使用。",
+    evaluationModeReason: modeReason,
     entryFrameDetails: entrySelection.details,
+    candidateWindowsTopN: entrySelection.candidateWindows,
   };
 }
 
@@ -137,6 +151,7 @@ interface EntryFrameSelection {
     spineAngles: number[];
     selectionReason: string;
   };
+  candidateWindows: CandidateWindow[];
 }
 
 /** Key landmarks that must be visible for a reliable planche evaluation */
@@ -163,24 +178,28 @@ function frameSkeletonQuality(frame: NormalizedFrame): number {
   return count > 0 ? totalVis / count : 0;
 }
 
+/** Per-frame scoring data for entry frame selection */
+interface FrameScore {
+  index: number;
+  timestamp: number;
+  spineAngle: number;
+  horizontalDev: number;
+  skelQuality: number;
+  ySpread: number;
+  elbowExtension: number;
+  compositeScore: number;
+}
+
 /**
- * For entry mode: find frames where the body is closest to horizontal (planche position).
- * Factors in spine angle closeness to 90°, skeleton visibility, and
- * shoulder-hip-ankle alignment to avoid selecting frames with missing bones.
- *
- * Returns top N frames sorted by timestamp, plus selection details for debug.
+ * Score each frame for entry-mode candidate selection.
+ * Composite score factors: horizontal deviation, skeleton quality,
+ * body straightness (Y spread), and elbow extension stability.
  */
-function findBestEntryFrames(
+function scoreFramesForEntry(
   series: NormalizedTimeSeries,
   features: FeatureSet
-): EntryFrameSelection {
-  if (series.frames.length === 0) {
-    return { frames: [], details: { frameIndices: [], spineAngles: [], selectionReason: "フレームなし" } };
-  }
-
-  // Score each frame: lower = better candidate
-  // Composite score = horizontalDev * (1 + visibilityPenalty)
-  const scored = features.angles.map((a, i) => {
+): FrameScore[] {
+  return features.angles.map((a, i) => {
     const frame = series.frames[i];
     const horizontalDev = Math.abs(a.spineAngle - 90);
     const skelQuality = frameSkeletonQuality(frame);
@@ -188,44 +207,245 @@ function findBestEntryFrames(
     // Penalty for low visibility (0 = perfect, up to 2x penalty for very poor)
     const visPenalty = skelQuality >= 0.7 ? 0 : (0.7 - skelQuality) * 3;
 
-    // Bonus: how well aligned are shoulder-hip-ankle in Y (body straightness)
+    // Body straightness: shoulder-hip-ankle Y alignment
     const lm = frame.landmarks;
     const sY = (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y) / 2;
     const hY = (lm[LM.LEFT_HIP].y + lm[LM.RIGHT_HIP].y) / 2;
     const aY = (lm[LM.LEFT_ANKLE].y + lm[LM.RIGHT_ANKLE].y) / 2;
     const ySpread = Math.max(sY, hY, aY) - Math.min(sY, hY, aY);
-    // ySpread near 0 = very horizontal, add a small penalty for spread
-    const spreadPenalty = ySpread * 10;
+
+    // Elbow extension (closer to 180° is better)
+    const elbowExtension = (a.leftElbow + a.rightElbow) / 2;
+    const elbowPenalty = Math.max(0, (180 - elbowExtension) - 10) * 0.3;
+
+    const compositeScore =
+      horizontalDev * (1 + visPenalty) +
+      ySpread * 10 +
+      elbowPenalty;
 
     return {
       index: i,
+      timestamp: frame.timestamp,
       spineAngle: a.spineAngle,
       horizontalDev,
       skelQuality,
-      compositeScore: horizontalDev * (1 + visPenalty) + spreadPenalty,
+      ySpread,
+      elbowExtension,
+      compositeScore,
     };
   });
+}
 
-  // Sort by composite score (lower is better)
-  scored.sort((a, b) => a.compositeScore - b.compositeScore);
+/**
+ * Group consecutive frames into continuous windows.
+ * A window is a set of frames where each frame's index is at most
+ * `maxGap` apart from its neighbor.
+ */
+function groupIntoWindows(
+  frameScores: FrameScore[],
+  maxGap: number = 2
+): FrameScore[][] {
+  if (frameScores.length === 0) return [];
 
-  // Take up to 5 best frames, but reject any with very poor skeleton quality
+  const sorted = [...frameScores].sort((a, b) => a.index - b.index);
+  const groups: FrameScore[][] = [[sorted[0]]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const current = sorted[i];
+    const lastGroup = groups[groups.length - 1];
+    const lastFrame = lastGroup[lastGroup.length - 1];
+
+    if (current.index - lastFrame.index <= maxGap) {
+      lastGroup.push(current);
+    } else {
+      groups.push([current]);
+    }
+  }
+
+  return groups;
+}
+
+/**
+ * Score a window (group of consecutive frames) for candidate ranking.
+ * Lower is better.
+ *
+ * @param totalFrameCount Total frames in the video (for edge proximity calculation)
+ */
+function scoreWindow(frames: FrameScore[], totalFrameCount: number): {
+  compositeScore: number;
+  avgHorizontalDev: number;
+  avgSkelQuality: number;
+  avgSpreadPenalty: number;
+  continuity: number;
+  edgeProximity: number;
+  isEdgeWindow: boolean;
+} {
+  const n = frames.length;
+  const avgHorizontalDev = frames.reduce((s, f) => s + f.horizontalDev, 0) / n;
+  const avgSkelQuality = frames.reduce((s, f) => s + f.skelQuality, 0) / n;
+  const avgSpread = frames.reduce((s, f) => s + f.ySpread, 0) / n;
+
+  // Continuity: ratio of actual frames to span (1.0 = perfectly consecutive)
+  const span = frames[n - 1].index - frames[0].index + 1;
+  const continuity = span > 0 ? n / span : 1;
+
+  // Bonus for having more frames (more stable measurement)
+  const framePenalty = Math.max(0, (3 - n) * 5); // penalize windows with < 3 frames
+
+  // Bonus for continuity
+  const continuityPenalty = (1 - continuity) * 10;
+
+  // Edge proximity: how close is the window's last frame to the clip end
+  const lastFrameIndex = frames[frames.length - 1].index;
+  const edgeDistanceFrames = Math.max(0, totalFrameCount - 1 - lastFrameIndex);
+  const edgeProximity = totalFrameCount > 1 ? edgeDistanceFrames / (totalFrameCount - 1) : 0;
+  const isEdgeWindow = edgeDistanceFrames <= 2; // within last 2 frames of clip
+
+  // Edge penalty: prefer plateau (multi-frame stable window) over single-frame peaks at clip end.
+  // Small enough that a genuinely better edge window still wins, but breaks ties
+  // in favor of mid-clip candidates.
+  const edgePenalty = isEdgeWindow
+    ? (n <= 2 ? 3 : 1)  // single/pair frame at edge: +3, multi-frame plateau: +1
+    : 0;
+
+  const compositeScore =
+    avgHorizontalDev * (1 + Math.max(0, (0.7 - avgSkelQuality) * 3)) +
+    avgSpread * 10 +
+    framePenalty +
+    continuityPenalty +
+    edgePenalty;
+
+  return { compositeScore, avgHorizontalDev, avgSkelQuality, avgSpreadPenalty: avgSpread, continuity, edgeProximity, isEdgeWindow };
+}
+
+/**
+ * For entry mode: find the best continuous frame group where the body is
+ * closest to horizontal (planche position).
+ *
+ * Strategy:
+ * 1. Score all frames individually
+ * 2. Take top 40% of frames by composite score (minimum skeleton quality)
+ * 3. Group them into continuous windows (max gap = 2 frames)
+ * 4. Score each window as a group (avg metrics + continuity bonus)
+ * 5. Return the best window's frames, plus top-N candidates for transparency
+ */
+function findBestEntryFrames(
+  series: NormalizedTimeSeries,
+  features: FeatureSet
+): EntryFrameSelection {
+  if (series.frames.length === 0) {
+    return {
+      frames: [],
+      details: { frameIndices: [], spineAngles: [], selectionReason: "フレームなし" },
+      candidateWindows: [],
+    };
+  }
+
+  const allScored = scoreFramesForEntry(series, features);
+
+  // Filter to frames with minimum skeleton quality
   const MIN_SKEL_QUALITY = 0.3;
-  const candidates = scored.filter(s => s.skelQuality >= MIN_SKEL_QUALITY);
-  const best = (candidates.length > 0 ? candidates : scored).slice(0, Math.min(5, scored.length));
-  const bestIndices = best.map(s => s.index);
-  bestIndices.sort((a, b) => a - b); // restore time order
+  const validFrames = allScored.filter(s => s.skelQuality >= MIN_SKEL_QUALITY);
+  const pool = validFrames.length > 0 ? validFrames : allScored;
 
-  const sortedBest = bestIndices.map(idx => best.find(b => b.index === idx)!);
-  const topCandidate = scored[0];
+  // Sort by composite score, take top 40% (at least 5, at most 20)
+  const sortedPool = [...pool].sort((a, b) => a.compositeScore - b.compositeScore);
+  const topCount = Math.max(5, Math.min(20, Math.ceil(pool.length * 0.4)));
+  const topFrames = sortedPool.slice(0, Math.min(topCount, sortedPool.length));
+
+  // Group into continuous windows
+  const windows = groupIntoWindows(topFrames);
+
+  // Score each window and build candidate list
+  const totalFrameCount = series.frames.length;
+  const rankedWindows = windows.map(w => {
+    const ws = scoreWindow(w, totalFrameCount);
+    return { frames: w, ...ws };
+  });
+  rankedWindows.sort((a, b) => a.compositeScore - b.compositeScore);
+
+  // Build CandidateWindow objects for top-5
+  const MAX_CANDIDATES = 5;
+  const candidateWindows: CandidateWindow[] = rankedWindows
+    .slice(0, MAX_CANDIDATES)
+    .map((w, rank) => ({
+      rank: rank + 1,
+      startTime: w.frames[0].timestamp,
+      endTime: w.frames[w.frames.length - 1].timestamp,
+      frameIndices: w.frames.map(f => f.index),
+      compositeScore: Math.round(w.compositeScore * 100) / 100,
+      features: {
+        avgHorizontalDev: Math.round(w.avgHorizontalDev * 10) / 10,
+        avgSkelQuality: Math.round(w.avgSkelQuality * 100) / 100,
+        avgSpreadPenalty: Math.round(w.avgSpreadPenalty * 1000) / 1000,
+        frameCount: w.frames.length,
+        continuity: Math.round(w.continuity * 100) / 100,
+        edgeProximity: Math.round(w.edgeProximity * 1000) / 1000,
+        isEdgeWindow: w.isEdgeWindow,
+      },
+    }));
+
+  // Select best window
+  const bestWindow = rankedWindows[0];
+  if (!bestWindow) {
+    // Fallback: use first 3 frames
+    const fallbackFrames = allScored.slice(0, Math.min(3, allScored.length));
+    return {
+      frames: fallbackFrames.map(f => series.frames[f.index]),
+      details: {
+        frameIndices: fallbackFrames.map(f => f.index),
+        spineAngles: fallbackFrames.map(f => Math.round(f.spineAngle * 10) / 10),
+        selectionReason: "候補フレームが不足のためフォールバック選択",
+      },
+      candidateWindows: [],
+    };
+  }
+
+  const bestFramesSorted = [...bestWindow.frames].sort((a, b) => a.index - b.index);
+  const bestIndices = bestFramesSorted.map(f => f.index);
+  const bestSpineAngles = bestFramesSorted.map(f => Math.round(f.spineAngle * 10) / 10);
+
+  const startTime = bestFramesSorted[0].timestamp;
+  const endTime = bestFramesSorted[bestFramesSorted.length - 1].timestamp;
+
+  // Determine selection category for transparency
+  const selectionCategory =
+    bestFramesSorted.length >= 5 && bestWindow.continuity >= 0.8
+      ? "最安定"
+      : bestWindow.avgHorizontalDev <= 10
+        ? "最水平"
+        : bestWindow.avgSkelQuality >= 0.9
+          ? "品質優先"
+          : "総合最良";
+
+  // Edge proximity info
+  const edgeDistSec = series.duration - endTime;
+  const edgeDistFrames = totalFrameCount - 1 - bestFramesSorted[bestFramesSorted.length - 1].index;
+  const edgeNote = bestWindow.isEdgeWindow
+    ? ` ※動画終端から${edgeDistSec.toFixed(1)}秒（${edgeDistFrames}フレーム）の位置。`
+    : ` 終端から${edgeDistSec.toFixed(1)}秒（${edgeDistFrames}フレーム）離れた位置。`;
+
+  // Runner-up info for context
+  const runnerUpNote = rankedWindows.length >= 2
+    ? ` 次点候補: ${rankedWindows[1].frames[0].timestamp.toFixed(1)}〜${rankedWindows[1].frames[rankedWindows[1].frames.length - 1].timestamp.toFixed(1)}秒（偏差${rankedWindows[1].avgHorizontalDev.toFixed(1)}°）。`
+    : "";
+
+  const selectionReason =
+    `${series.duration.toFixed(1)}秒の動画のうち、` +
+    `${startTime.toFixed(1)}〜${endTime.toFixed(1)}秒付近を主に採点。` +
+    `選定根拠: ${selectionCategory}（平均偏差: ${bestWindow.avgHorizontalDev.toFixed(1)}°、` +
+    `骨格品質: ${(bestWindow.avgSkelQuality * 100).toFixed(0)}%、` +
+    `連続${bestFramesSorted.length}フレーム）。` +
+    edgeNote + runnerUpNote;
 
   return {
     frames: bestIndices.map(i => series.frames[i]),
     details: {
       frameIndices: bestIndices,
-      spineAngles: sortedBest.map(b => Math.round(b.spineAngle * 10) / 10),
-      selectionReason: `体幹角度+骨格品質の複合スコアで${bestIndices.length}フレームを選択（最小偏差: ${topCandidate.horizontalDev.toFixed(1)}°, 骨格品質: ${(topCandidate.skelQuality * 100).toFixed(0)}%）`,
+      spineAngles: bestSpineAngles,
+      selectionReason,
     },
+    candidateWindows,
   };
 }
 
@@ -358,12 +578,19 @@ export function evaluatePlanche(
     });
   }
 
+  // Entry mode uses softer deductions for body_line to prevent side-view normalization
+  // from causing 0-score. In side view, shoulder width is small (~5% of frame),
+  // inflating normalized yRange enormously (e.g., 4.0+ shoulder widths).
+  const isEntry = mode.mode === "entry";
+  const spineDeduction = isEntry ? C.bodyLineEntry.spineDeductionPerDeg : C.bodyLine.spineDeductionPerDeg;
+  const yRangeMult = isEntry ? C.bodyLineEntry.yRangeDeductionMultiplier : C.bodyLine.yRangeDeductionMultiplier;
+  const effectiveYRange = isEntry ? Math.min(avgYRange, C.bodyLineEntry.yRangeCap) : avgYRange;
   const bodyLineScore = Math.round(Math.max(0,
-    100 - actualSpineDev * C.bodyLine.spineDeductionPerDeg - avgYRange * C.bodyLine.yRangeDeductionMultiplier));
+    100 - actualSpineDev * spineDeduction - effectiveYRange * yRangeMult));
   const bodyLineBreakdown: ScoreBreakdown = {
     category: "body_line", label: "体幹ライン", score: bodyLineScore, weight: 0,
     violations: violations.filter(v => v.ruleId.includes("body_line") || v.ruleId.includes("body_not")),
-    measurements: { avgSpine, actualSpineDev, avgYRange }, frameRange,
+    measurements: { avgSpine, actualSpineDev, avgYRange, ...(isEntry ? { effectiveYRange, yRangeCapped: avgYRange > C.bodyLineEntry.yRangeCap ? 1 : 0 } : {}) }, frameRange,
   };
 
   // ---- 3. Hip Sag ----
@@ -515,9 +742,21 @@ export function evaluatePlanche(
   // Build scoring reason for coverageInfo
   const scoringReason = mode.mode === "hold"
     ? "静止保持区間（最長の安定区間）"
-    : "体幹角度+骨格品質の複合スコアで選定した代表フレーム";
+    : "体幹角度+骨格品質の複合スコアで選定した代表フレーム群";
 
   const coverageInfo = buildCoverageInfo(series, startIdx, endIdx, scoringReason, sampling);
+
+  // Build selectedEvaluationWindow
+  const scoringStartTime = series.frames[startIdx]?.timestamp ?? 0;
+  const scoringEndTime = series.frames[endIdx]?.timestamp ?? series.duration;
+
+  // Edge distance for the selected window
+  const selectedEdgeDistSec = Math.round((series.duration - scoringEndTime) * 10) / 10;
+  const selectedEdgeDistFrames = Math.max(0, series.frames.length - 1 - endIdx);
+
+  const selectedReason = mode.mode === "hold"
+    ? `${scoringStartTime.toFixed(1)}〜${scoringEndTime.toFixed(1)}秒の区間で最も長い静止保持が検出されたため、この区間を採点に使用しました。終端から${selectedEdgeDistSec}秒（${selectedEdgeDistFrames}フレーム）。`
+    : mode.entryFrameDetails?.selectionReason ?? "最も水平に近い連続フレーム群を選択しました。";
 
   return {
     technique: "planche", finalScore, breakdown,
@@ -534,6 +773,10 @@ export function evaluatePlanche(
       confidenceNote: mode.confidenceNote,
       ...(mode.entryFrameDetails ? { entryFrameDetails: mode.entryFrameDetails } : {}),
       coverageInfo,
+      evaluationModeReason: mode.evaluationModeReason,
+      selectedEvaluationWindow: { startTime: scoringStartTime, endTime: scoringEndTime },
+      selectedReason,
+      ...(mode.candidateWindowsTopN ? { candidateWindowsTopN: mode.candidateWindowsTopN } : {}),
     },
   };
 }

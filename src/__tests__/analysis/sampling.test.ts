@@ -148,7 +148,7 @@ describe("Long video planche evaluation", () => {
     const features = extractFeatures(normalized);
     const result = evaluate("planche", normalized, features);
 
-    expect(result.meta.configVersion).toBe("2.3");
+    expect(result.meta.configVersion).toBe("2.4");
   });
 
   it("sampling info is populated when passed through pipeline input", () => {
@@ -221,7 +221,9 @@ describe("Coverage info verification", () => {
 
     expect(result.meta.coverageInfo).toBeDefined();
     expect(result.meta.coverageInfo!.fullScanPerformed).toBe(true);
-    expect(result.meta.coverageInfo!.finalScoringWindow.reason).toContain("全フレーム");
+    // v3.0: scoring reason describes either selected cycle or full-frame fallback
+    const reason = result.meta.coverageInfo!.finalScoringWindow.reason;
+    expect(reason).toMatch(/サイクル|全フレーム/);
   });
 
   it("coverageInfo coarse scan covers first to last frame", () => {

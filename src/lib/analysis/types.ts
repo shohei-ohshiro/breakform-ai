@@ -379,8 +379,8 @@ export interface EvaluationResult {
     staticIntervalUsed: StaticInterval | null;
     totalFrames: number;
     configVersion: string;
-    /** For static techniques: was the video classified as hold or entry? */
-    evaluationMode?: "hold" | "entry";
+    /** Static techniques: hold/entry. Dynamic (swipes): multi_cycle/single_cycle/partial/insufficient. */
+    evaluationMode?: "hold" | "entry" | "multi_cycle" | "single_cycle" | "partial" | "insufficient";
     /** Duration (seconds) of the static interval used for evaluation */
     holdDuration?: number;
     /** Ratio of hold duration to total video duration (0-1) */
@@ -397,7 +397,96 @@ export interface EvaluationResult {
     sampling?: SamplingInfo;
     /** Coverage info: what was scanned vs what was scored */
     coverageInfo?: CoverageInfo;
+
+    // --- Evaluation transparency fields (always returned) ---
+
+    /** Human-readable reason why hold/entry mode was chosen */
+    evaluationModeReason?: string;
+    /** The time window actually used for scoring */
+    selectedEvaluationWindow?: { startTime: number; endTime: number };
+    /** Human-readable reason why this window was selected */
+    selectedReason?: string;
+    /** Top-N candidate windows considered for scoring, ranked best-first */
+    candidateWindowsTopN?: CandidateWindow[];
+    /** Summary of how quality issues affected this analysis */
+    qualityImpactSummary?: QualityImpactSummary;
+    /** Swipes-only: per-cycle summary */
+    cycleSummary?: SwipesCycleSummary;
+    /** Swipes-only: event count summary */
+    eventSummary?: SwipesEventSummary;
   };
+}
+
+/** A candidate evaluation window with ranking features */
+export interface CandidateWindow {
+  rank: number;
+  startTime: number;
+  endTime: number;
+  frameIndices: number[];
+  /** Composite score (lower = better candidate) */
+  compositeScore: number;
+  /** Individual ranking features. Common fields apply to all techniques;
+   *  technique-specific fields are optional. */
+  features: {
+    // ---- Common ----
+    frameCount: number;
+    /** Continuity: are frames consecutive or scattered? */
+    continuity: number; // 0-1, 1 = perfectly consecutive
+    /** Distance from window end to clip end (0 = at clip end, 1 = at clip start) */
+    edgeProximity: number;
+    /** Whether this window is within the last few frames of the clip */
+    isEdgeWindow: boolean;
+
+    // ---- Planche / static (optional) ----
+    avgHorizontalDev?: number;
+    avgSkelQuality?: number;
+    avgSpreadPenalty?: number;
+
+    // ---- Swipes / dynamic (optional) ----
+    /** 0-1, how clearly cycle events were detected */
+    cycleClarity?: number;
+    /** Spine deviation from horizontal (deg, lower=better) */
+    rotationHorizontality?: number;
+    /** Peak ankle speed during the cycle */
+    kickPeakSpeed?: number;
+    /** Visibility of key landmarks (0-1) */
+    visibilityScore?: number;
+  };
+}
+
+/** Per-cycle summary for swipes (multi-cycle/single-cycle/partial) */
+export interface SwipesCycleSummary {
+  detectedCycles: number;
+  selectedCycleIndex: number;
+  cycleDurations: number[];
+  avgCycleDuration: number;
+}
+
+/** Event count summary for swipes */
+export interface SwipesEventSummary {
+  handPlantCount: number;
+  legSwingCount: number;
+  phaseChangeCount: number;
+  kickPeakCount: number;
+}
+
+/** Summary of how quality warnings affect the analysis result */
+export interface QualityImpactSummary {
+  /** Overall analysis reliability (0-1) */
+  reliability: number;
+  /** Per-warning impact descriptions */
+  impacts: QualityImpact[];
+}
+
+export interface QualityImpact {
+  /** Warning category */
+  category: "subject_size" | "visibility" | "skeleton_gap" | "out_of_frame" | "short_hold" | "frame_instability" | "motion_blur" | "low_cycle_clarity";
+  /** Human-readable impact description */
+  description: string;
+  /** How much this warning reduced reliability (0-1) */
+  reliabilityPenalty: number;
+  /** Which score categories are affected */
+  affectedCategories?: string[];
 }
 
 /**

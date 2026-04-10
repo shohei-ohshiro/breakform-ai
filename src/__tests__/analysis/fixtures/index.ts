@@ -556,6 +556,176 @@ function makeLongHandstand(): PoseTimeSeries {
 }
 
 // ============================================
+// Swipes Fixture Builder (for v3.0 cycle/mode tests)
+// ============================================
+
+type SwipePhase = "hands" | "aerial";
+
+interface SwipeFixtureOpts {
+  pattern: SwipePhase[];
+  fps?: number;
+  visibility?: number;
+  /** Per-frame X position function for left ankle. Defaults to swinging motion. */
+  leftAnkleX?: (i: number, phase: SwipePhase) => number;
+  rightAnkleX?: (i: number, phase: SwipePhase) => number;
+  /** Per-frame Y position function for ankles. Defaults to phase-dependent (0.25/0.85). */
+  ankleY?: (i: number, phase: SwipePhase) => number;
+  /** Override hip Y to test hip angle scoring */
+  hipYOffset?: number;
+  /** Override elbow Y to test bent-elbow detection */
+  elbowYOffset?: number;
+  /**
+   * If true, hip / shoulder / knee / elbow / ankle Y stay constant across
+   * phases — only wrists move. Use this when you need plant detection but
+   * want to suppress normalization-induced velocity (e.g. weak-kick fixture).
+   */
+  staticBody?: boolean;
+}
+
+function buildSwipeFixture(opts: SwipeFixtureOpts): PoseTimeSeries {
+  const fps = opts.fps ?? 10;
+  const vis = opts.visibility ?? 0.9;
+  const lAnkleX = opts.leftAnkleX ?? ((i, p) => (p === "hands" ? 0.60 + (i % 5) * 0.1 : 0.50 + (i % 5) * 0.05));
+  const rAnkleX = opts.rightAnkleX ?? ((i, p) => (p === "hands" ? 0.70 + (i % 5) * 0.1 : 0.60 + (i % 5) * 0.05));
+  const ankleY = opts.ankleY ?? ((_i, p) => (p === "hands" ? 0.25 : 0.85));
+  const hipDy = opts.hipYOffset ?? 0;
+  const elbowDy = opts.elbowYOffset ?? 0;
+  const staticBody = opts.staticBody ?? false;
+
+  const frames: PoseFrame[] = opts.pattern.map((phase, i) => {
+    const t = i / fps;
+    let landmarks: Landmark[];
+    if (phase === "hands") {
+      landmarks = fill33({
+        [LM.LEFT_WRIST]:    lm(0.40, 0.92, 0, vis),
+        [LM.RIGHT_WRIST]:   lm(0.50, 0.92, 0, vis),
+        [LM.LEFT_SHOULDER]: lm(staticBody ? 0.43 : 0.38, staticBody ? 0.50 : 0.62, 0, vis),
+        [LM.RIGHT_SHOULDER]: lm(staticBody ? 0.57 : 0.52, staticBody ? 0.50 : 0.62, 0, vis),
+        [LM.LEFT_HIP]:      lm(0.50, (staticBody ? 0.55 : 0.45) + hipDy, 0, vis),
+        [LM.RIGHT_HIP]:     lm(0.60, (staticBody ? 0.55 : 0.45) + hipDy, 0, vis),
+        [LM.LEFT_KNEE]:     lm(staticBody ? 0.50 : 0.55, staticBody ? 0.70 : 0.35, 0, vis),
+        [LM.RIGHT_KNEE]:    lm(staticBody ? 0.60 : 0.65, staticBody ? 0.70 : 0.35, 0, vis),
+        [LM.LEFT_ANKLE]:    lm(lAnkleX(i, phase), ankleY(i, phase), 0, vis),
+        [LM.RIGHT_ANKLE]:   lm(rAnkleX(i, phase), ankleY(i, phase), 0, vis),
+        [LM.LEFT_ELBOW]:    lm(staticBody ? 0.42 : 0.40, (staticBody ? 0.45 : 0.78) + elbowDy, 0, vis),
+        [LM.RIGHT_ELBOW]:   lm(staticBody ? 0.52 : 0.50, (staticBody ? 0.45 : 0.78) + elbowDy, 0, vis),
+      });
+    } else {
+      landmarks = fill33({
+        [LM.LEFT_WRIST]:    lm(0.40, 0.40, 0, vis),
+        [LM.RIGHT_WRIST]:   lm(0.50, 0.40, 0, vis),
+        [LM.LEFT_SHOULDER]: lm(0.43, 0.50, 0, vis),
+        [LM.RIGHT_SHOULDER]: lm(0.57, 0.50, 0, vis),
+        [LM.LEFT_HIP]:      lm(0.50, 0.55, 0, vis),
+        [LM.RIGHT_HIP]:     lm(0.60, 0.55, 0, vis),
+        [LM.LEFT_KNEE]:     lm(0.50, 0.70, 0, vis),
+        [LM.RIGHT_KNEE]:    lm(0.60, 0.70, 0, vis),
+        [LM.LEFT_ANKLE]:    lm(lAnkleX(i, phase), ankleY(i, phase), 0, vis),
+        [LM.RIGHT_ANKLE]:   lm(rAnkleX(i, phase), ankleY(i, phase), 0, vis),
+        [LM.LEFT_ELBOW]:    lm(0.42, 0.45, 0, vis),
+        [LM.RIGHT_ELBOW]:   lm(0.52, 0.45, 0, vis),
+      });
+    }
+    return { timestamp: t, landmarks };
+  });
+  return { frames, fps, duration: opts.pattern.length / fps, sourceType: "video" };
+}
+
+/** Pattern helper: alternating runs of `phaseLen` between aerial and hands. */
+function patternRuns(...runs: { phase: SwipePhase; len: number }[]): SwipePhase[] {
+  const out: SwipePhase[] = [];
+  for (const r of runs) for (let i = 0; i < r.len; i++) out.push(r.phase);
+  return out;
+}
+
+/** Multi-cycle: 3 hand_plants → 2 cycles → multi_cycle mode */
+function makeSwipesMultiCycle(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns(
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 3 },
+    ),
+  });
+}
+
+/** Single cycle: 2 hand_plants → 1 cycle → single_cycle mode */
+function makeSwipesSingleCycle(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns(
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 4 },
+    ),
+  });
+}
+
+/** Partial: never plants hands → 0 cycles → partial mode (score capped) */
+function makeSwipesPartial(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns({ phase: "aerial", len: 20 }),
+  });
+}
+
+/** Multi-cycle but with weak (slow) leg movement → low kick_power */
+function makeSwipesWeakKick(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns(
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 3 },
+    ),
+    staticBody: true, // hip / shoulder constant → no normalization-induced velocity
+    leftAnkleX: () => 0.55, // no horizontal swing
+    rightAnkleX: () => 0.65,
+    ankleY: () => 0.55, // constant Y → no kick velocity
+  });
+}
+
+/** Multi-cycle with strong left, weak right → kick_asymmetric violation */
+function makeSwipesAsymmetricKick(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns(
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 3 },
+    ),
+    leftAnkleX: (i, p) => (p === "hands" ? 0.60 + (i % 3) * 0.18 : 0.50 + (i % 3) * 0.18),
+    rightAnkleX: () => 0.70,
+  });
+}
+
+/** Multi-cycle with low visibility on wrists/ankles → quality impact */
+function makeSwipesLowVisibility(): PoseTimeSeries {
+  return buildSwipeFixture({
+    pattern: patternRuns(
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 5 },
+      { phase: "hands", len: 4 },
+      { phase: "aerial", len: 3 },
+    ),
+    visibility: 0.25,
+  });
+}
+
+// ============================================
 // Comparison Fixtures (first-half / second-half)
 // ============================================
 
@@ -596,6 +766,79 @@ function makeSecondHalf(series: PoseTimeSeries): PoseTimeSeries {
 }
 
 // ============================================
+// Mid-plateau vs End-peak Fixture
+// ============================================
+
+/**
+ * Video where middle has a stable near-horizontal plateau (5+ frames)
+ * and the very end has a 1-frame peak that is slightly more horizontal.
+ * Tests that plateau preference wins over single-frame end-of-clip peak.
+ */
+function makePlancheMidPlateauVsEndPeak(): PoseTimeSeries {
+  const fps = 10;
+  const duration = 8.0;
+  const frameCount = 40;
+  const frames: PoseFrame[] = [];
+
+  for (let i = 0; i < frameCount; i++) {
+    const t = (i / (frameCount - 1)) * duration;
+    const progress = i / (frameCount - 1);
+
+    // Continuous movement to prevent static detection
+    const drift = progress * 0.12;
+    const shoulderX = 0.35 - drift;
+    const hipX = 0.55 + drift * 0.3;
+    const ankleX = 0.85 + drift * 0.2;
+
+    let shoulderY: number, hipY: number, ankleY: number;
+    const vis = 0.9;
+
+    // Mid-plateau: 35-55% of video (2.8s - 4.4s), near-horizontal (8° deviation)
+    const inPlateau = progress >= 0.35 && progress <= 0.55;
+    // End peak: last frame only, slightly better (5° deviation)
+    const isEndPeak = i === frameCount - 1;
+
+    if (isEndPeak) {
+      // Single frame at end: slightly more horizontal than plateau
+      shoulderY = 0.505;
+      hipY = 0.503;
+      ankleY = 0.500;
+    } else if (inPlateau) {
+      // Stable near-horizontal plateau (8° from horizontal, consistent)
+      shoulderY = 0.52;
+      hipY = 0.51;
+      ankleY = 0.50;
+    } else {
+      // Far from horizontal
+      shoulderY = 0.58 - progress * 0.04;
+      hipY = 0.42 + progress * 0.03;
+      ankleY = 0.30 + progress * 0.08;
+    }
+
+    const landmarks = fill33({
+      [LM.NOSE]:            lm(shoulderX - 0.05, shoulderY + 0.05, 0, vis),
+      [LM.LEFT_EAR]:        lm(shoulderX - 0.07, shoulderY + 0.04, 0.02, vis * 0.9),
+      [LM.RIGHT_EAR]:       lm(shoulderX - 0.03, shoulderY + 0.04, 0.02, vis * 0.9),
+      [LM.LEFT_WRIST]:      lm(0.30, 0.65, 0, vis),
+      [LM.RIGHT_WRIST]:     lm(0.40, 0.65, 0, vis),
+      [LM.LEFT_ELBOW]:      lm(0.30, 0.60, 0, vis),
+      [LM.RIGHT_ELBOW]:     lm(0.40, 0.60, 0, vis),
+      [LM.LEFT_SHOULDER]:   lm(shoulderX, shoulderY, 0, vis),
+      [LM.RIGHT_SHOULDER]:  lm(shoulderX + 0.10, shoulderY, 0, vis),
+      [LM.LEFT_HIP]:        lm(hipX, hipY, 0, vis),
+      [LM.RIGHT_HIP]:       lm(hipX + 0.10, hipY, 0, vis),
+      [LM.LEFT_KNEE]:       lm(ankleX - 0.15, ankleY + 0.05, 0, vis),
+      [LM.RIGHT_KNEE]:      lm(ankleX - 0.05, ankleY + 0.05, 0, vis),
+      [LM.LEFT_ANKLE]:      lm(ankleX, ankleY, 0, vis),
+      [LM.RIGHT_ANKLE]:     lm(ankleX + 0.10, ankleY, 0, vis),
+    });
+    frames.push({ timestamp: t, landmarks });
+  }
+
+  return { frames, fps, duration, sourceType: "video" };
+}
+
+// ============================================
 // Exports
 // ============================================
 
@@ -618,10 +861,24 @@ export const FIXTURES = {
     briefGoodMoment: makeLongPlancheWithBriefGoodMoment,
     /** Long entry (10s) where best moment is in the final 20% only */
     lateBestMoment: makePlancheLateBestMoment,
+    /** Mid-video plateau vs single-frame end peak */
+    midPlateauVsEndPeak: makePlancheMidPlateauVsEndPeak,
   },
   swipes: {
     withEvents: makeSwipesWithEvents,
     earlyHandPlant: makeSwipesEarlyHandPlant,
+    /** v3.0: 3 hand_plants → 2 cycles → multi_cycle mode */
+    multiCycle: makeSwipesMultiCycle,
+    /** v3.0: 2 hand_plants → 1 cycle → single_cycle mode */
+    singleCycle: makeSwipesSingleCycle,
+    /** v3.0: 0 hand_plants → 0 cycles → partial mode (score capped) */
+    partial: makeSwipesPartial,
+    /** v3.0: multi-cycle with no leg swing motion → low kick_power */
+    weakKick: makeSwipesWeakKick,
+    /** v3.0: left ankle swings, right is static → kick_asymmetric */
+    asymmetricKick: makeSwipesAsymmetricKick,
+    /** v3.0: low wrist/ankle visibility → quality impact warnings */
+    lowVisibility: makeSwipesLowVisibility,
   },
   /** Utilities for creating comparison variants */
   split: {

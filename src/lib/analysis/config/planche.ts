@@ -24,6 +24,24 @@ export const PLANCHE_CONFIG = {
     yRangeDeductionMultiplier: 30,
   },
 
+  /**
+   * Entry-mode body line thresholds (softer than hold mode).
+   *
+   * Why: In side-view planche, shoulder width appears very small (~5% of frame).
+   * Normalizing by shoulder width inflates Y-range enormously (e.g., raw 0.20 / 0.05 = 4.0).
+   * Hold-mode yRangeDeductionMultiplier (30) causes instant 0-score.
+   *
+   * Entry mode also double-penalizes horizontality: body_line measures spine deviation
+   * from 90° AND entry_quality measures approach angle. Softer deductions prevent this.
+   */
+  bodyLineEntry: {
+    spineDeductionPerDeg: 0.6,
+    yRangeDeductionMultiplier: 8,
+    /** Cap normalized yRange before applying deduction.
+     *  Prevents side-view normalization from causing runaway score loss. */
+    yRangeCap: 2.5,
+  },
+
   hipSag: {
     /** How far hip drops below shoulder-ankle midline (normalized) */
     sag: { ideal: 0, warn: 0.15, fail: 0.4 } satisfies ThresholdRange,

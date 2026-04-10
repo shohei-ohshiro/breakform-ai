@@ -124,7 +124,7 @@ describe("PlancheEvaluator", () => {
     const result = evaluate("planche", normalized, features);
 
     expect(result.meta).toBeDefined();
-    expect(result.meta.configVersion).toBe("2.3");
+    expect(result.meta.configVersion).toBe("2.4");
     expect(result.meta.evaluationMode).toBe("hold"); // image → always hold
   });
 
@@ -187,7 +187,7 @@ describe("SwipesEvaluator", () => {
     const result = evaluate("swipes", normalized, features);
 
     expect(result.meta).toBeDefined();
-    expect(result.meta.configVersion).toBe("2.0");
+    expect(result.meta.configVersion).toBe("3.0");
   });
 
   it("produces a result for video with enough frames", () => {
@@ -232,7 +232,7 @@ describe("Evaluator dispatcher", () => {
     const features = extractFeatures(normalized);
 
     expect(() =>
-      evaluate("unknown" as any, normalized, features)
+      evaluate("unknown" as unknown as Parameters<typeof evaluate>[0], normalized, features)
     ).toThrow("Unknown technique");
   });
 });

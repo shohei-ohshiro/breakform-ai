@@ -30,7 +30,10 @@ import {
   PoseTimeSeries,
   QualityCheckResult,
   QualityLevel,
+  QualityImpactSummary,
+  QualityImpact,
   SamplingInfo,
+  EvaluationResult,
   featureSetToJSON,
   FeatureSetJSON,
 } from "./types";
@@ -118,11 +121,10 @@ export async function runPipeline(
   // 5b. Attach sampling metadata if available
   if (input.sampling) {
     evaluation.meta.sampling = input.sampling;
-    // Update coverageInfo with sampling refinement phases
-    if (evaluation.meta.coverageInfo && input.sampling.selectedWindows.length > 0) {
-      evaluation.meta.coverageInfo.summary = evaluation.meta.coverageInfo.summary;
-    }
   }
+
+  // 5c. Compute quality impact summary
+  evaluation.meta.qualityImpactSummary = computeQualityImpact(qualityCheck, evaluation);
 
   // 6. Generate advice
   let generatedAdvice;
@@ -176,6 +178,101 @@ function computeQualityExplanation(quality: QualityCheckResult, level: QualityLe
     return "品質に注意点がありますが、参考分析として採点しました。数値は目安としてご活用ください。";
   }
   return "分析に十分な品質のデータが得られませんでした。再撮影をおすすめします。";
+}
+
+/**
+ * Compute how quality warnings affected the analysis results.
+ * Produces a reliability score and per-warning impact descriptions.
+ */
+function computeQualityImpact(
+  quality: QualityCheckResult,
+  evaluation: EvaluationResult
+): QualityImpactSummary {
+  const impacts: QualityImpact[] = [];
+  let reliabilityPenaltyTotal = 0;
+
+  const details = quality.details;
+
+  // Subject size impact
+  if (details.subjectSize > 0 && details.subjectSize < 0.15) {
+    const penalty = details.subjectSize < 0.08 ? 0.25 : 0.12;
+    reliabilityPenaltyTotal += penalty;
+    impacts.push({
+      category: "subject_size",
+      description: `被写体が小さく（肩幅: フレームの${(details.subjectSize * 100).toFixed(0)}%）、関節角度の推定精度が低下しています。肘伸展と体幹ラインの評価に影響します。`,
+      reliabilityPenalty: penalty,
+      affectedCategories: ["elbow_lockout", "body_line"],
+    });
+  }
+
+  // Visibility impact
+  if (details.avgVisibility < 0.7) {
+    const penalty = details.avgVisibility < 0.4 ? 0.3 : 0.15;
+    reliabilityPenaltyTotal += penalty;
+    const desc = details.avgVisibility < 0.4
+      ? `骨格検出精度が低く（${(details.avgVisibility * 100).toFixed(0)}%）、全カテゴリの評価信頼度が低下しています。`
+      : `骨格検出精度がやや低く（${(details.avgVisibility * 100).toFixed(0)}%）、微細な角度差の判定が不安定な可能性があります。`;
+    impacts.push({
+      category: "visibility",
+      description: desc,
+      reliabilityPenalty: penalty,
+      affectedCategories: ["shoulder_lean", "body_line", "hip_sag", "elbow_lockout"],
+    });
+  }
+
+  // Skeleton gap / missing frames
+  if (details.missingFrameRatio > 0.1) {
+    const penalty = details.missingFrameRatio > 0.3 ? 0.2 : 0.1;
+    reliabilityPenaltyTotal += penalty;
+    impacts.push({
+      category: "skeleton_gap",
+      description: `一部の区間で骨格が検出できておらず（${(details.missingFrameRatio * 100).toFixed(0)}%欠損）、最適な採点区間を見逃している可能性があります。`,
+      reliabilityPenalty: penalty,
+      affectedCategories: ["stability", "entry_quality"],
+    });
+  }
+
+  // Out of frame
+  if (details.outOfFrameRatio > 0.15) {
+    const penalty = details.outOfFrameRatio > 0.4 ? 0.2 : 0.1;
+    reliabilityPenaltyTotal += penalty;
+    impacts.push({
+      category: "out_of_frame",
+      description: `体の一部がフレーム外に出ているフレームが${(details.outOfFrameRatio * 100).toFixed(0)}%あり、脚や足先の評価精度が低下しています。`,
+      reliabilityPenalty: penalty,
+      affectedCategories: ["hip_sag", "body_line"],
+    });
+  }
+
+  // Short hold (for hold mode)
+  if (evaluation.meta.evaluationMode === "hold" && evaluation.meta.holdDuration != null) {
+    if (evaluation.meta.holdDuration < 2.0 && evaluation.meta.holdDuration >= 1.0) {
+      const penalty = 0.1;
+      reliabilityPenaltyTotal += penalty;
+      impacts.push({
+        category: "short_hold",
+        description: `静止保持が${evaluation.meta.holdDuration.toFixed(1)}秒と短めです。2秒以上の保持でより安定した評価になります。`,
+        reliabilityPenalty: penalty,
+        affectedCategories: ["stability"],
+      });
+    }
+  }
+
+  // Frame instability
+  if (details.visibilityStdDev > 0.1) {
+    const penalty = 0.08;
+    reliabilityPenaltyTotal += penalty;
+    impacts.push({
+      category: "frame_instability",
+      description: `フレーム間でvisibilityが不安定（σ=${details.visibilityStdDev.toFixed(2)}）で、フレームごとの評価にばらつきが出ています。`,
+      reliabilityPenalty: penalty,
+      affectedCategories: ["stability", "entry_quality"],
+    });
+  }
+
+  const reliability = Math.max(0, Math.min(1, 1 - reliabilityPenaltyTotal));
+
+  return { reliability, impacts };
 }
 
 function emptyFeatureJson(): FeatureSetJSON {

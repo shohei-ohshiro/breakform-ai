@@ -79,12 +79,24 @@ interface ExtendedResult extends AnalysisResult {
   qualityLevel?: "good" | "reference" | "retry";
   qualityExplanation?: string;
   meta?: {
-    evaluationMode?: "hold" | "entry";
+    evaluationMode?: "hold" | "entry" | "multi_cycle" | "single_cycle" | "partial" | "insufficient";
     holdDuration?: number;
     holdRatio?: number;
     confidenceNote?: string;
     analyzedFrameRange?: [number, number];
     totalFrames?: number;
+    cycleSummary?: {
+      detectedCycles: number;
+      selectedCycleIndex: number;
+      cycleDurations: number[];
+      avgCycleDuration: number;
+    };
+    eventSummary?: {
+      handPlantCount: number;
+      legSwingCount: number;
+      phaseChangeCount: number;
+      kickPeakCount: number;
+    };
     entryFrameDetails?: {
       frameIndices: number[];
       spineAngles: number[];
@@ -117,6 +129,42 @@ interface ExtendedResult extends AnalysisResult {
       };
     };
     coverageInfo?: CoverageInfoUI;
+    // Evaluation transparency fields
+    evaluationModeReason?: string;
+    selectedEvaluationWindow?: { startTime: number; endTime: number };
+    selectedReason?: string;
+    candidateWindowsTopN?: {
+      rank: number;
+      startTime: number;
+      endTime: number;
+      frameIndices: number[];
+      compositeScore: number;
+      features: {
+        // Common
+        frameCount: number;
+        continuity: number;
+        edgeProximity?: number;
+        isEdgeWindow?: boolean;
+        // Planche-only
+        avgHorizontalDev?: number;
+        avgSkelQuality?: number;
+        avgSpreadPenalty?: number;
+        // Swipes-only
+        cycleClarity?: number;
+        rotationHorizontality?: number;
+        kickPeakSpeed?: number;
+        visibilityScore?: number;
+      };
+    }[];
+    qualityImpactSummary?: {
+      reliability: number;
+      impacts: {
+        category: string;
+        description: string;
+        reliabilityPenalty: number;
+        affectedCategories?: string[];
+      }[];
+    };
   };
   // Build info (always returned)
   buildInfo?: {
@@ -200,7 +248,7 @@ function AnalyzePage() {
 
       const isVideo = file.type.startsWith("video/");
       let frames: { timestamp: number; landmarks: Landmark[] }[] = [];
-      let fps = 10;
+      const fps = 10;
       let duration = 0;
       let sampling: SamplingInfo | undefined;
 
@@ -481,58 +529,201 @@ function AnalyzePage() {
               </div>
             )}
 
-            {/* Evaluation Mode Banner — shown when evaluationMode is set */}
-            {result?.meta?.evaluationMode && (
-              <div className={`rounded-xl p-4 border ${
-                result.meta.evaluationMode === "entry"
-                  ? "bg-blue-500/10 border-blue-500/30"
-                  : result.meta.confidenceNote
-                    ? "bg-yellow-500/10 border-yellow-500/30"
-                    : "bg-green-500/10 border-green-500/30"
-              }`}>
-                <div className="flex items-center gap-2 mb-1">
-                  <span className={`text-sm font-medium ${
-                    result.meta.evaluationMode === "entry" ? "text-blue-400" : "text-green-400"
-                  }`}>
-                    {result.meta.evaluationMode === "entry" ? "進入フォーム評価" : "保持評価"}
-                  </span>
-                  {result.meta.holdDuration != null && result.meta.holdDuration > 0 && (
-                    <span className="text-xs text-gray-500">
-                      (静止保持: {result.meta.holdDuration.toFixed(1)}秒)
+            {/* Evaluation Transparency — always shown for video results */}
+            {result?.meta?.evaluationMode && (() => {
+              const mode = result.meta.evaluationMode;
+              const modeMeta: Record<string, { label: string; color: string }> = {
+                hold:         { label: "保持評価",       color: "text-green-400" },
+                entry:        { label: "進入フォーム評価", color: "text-blue-400" },
+                multi_cycle:  { label: "連続サイクル評価", color: "text-green-400" },
+                single_cycle: { label: "単サイクル評価",   color: "text-blue-400" },
+                partial:      { label: "部分動作評価",     color: "text-yellow-400" },
+                insufficient: { label: "評価不可（フレーム不足）", color: "text-red-400" },
+              };
+              const m = modeMeta[mode] ?? { label: mode, color: "text-gray-300" };
+              return (
+              <div className="rounded-xl p-4 border bg-gray-800/50 border-gray-700 space-y-3">
+                {/* Evaluation Mode */}
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className={`text-sm font-semibold ${m.color}`}>
+                      {m.label}
                     </span>
+                    {result.meta.holdDuration != null && result.meta.holdDuration > 0 && (
+                      <span className="text-xs text-gray-500">
+                        (静止保持: {result.meta.holdDuration.toFixed(1)}秒)
+                      </span>
+                    )}
+                    {result.meta.cycleSummary && result.meta.cycleSummary.detectedCycles > 0 && (
+                      <span className="text-xs text-gray-500">
+                        (検出サイクル: {result.meta.cycleSummary.detectedCycles}、平均{result.meta.cycleSummary.avgCycleDuration.toFixed(1)}秒)
+                      </span>
+                    )}
+                  </div>
+                  {result.meta.evaluationModeReason && (
+                    <p className="text-xs text-gray-400">{result.meta.evaluationModeReason}</p>
                   )}
                 </div>
-                {result.meta.confidenceNote && (
-                  <p className="text-sm text-gray-300 mt-1">{result.meta.confidenceNote}</p>
-                )}
-              </div>
-            )}
 
-            {/* Coverage Summary — ALWAYS shown for video results (not gated by evaluationMode) */}
-            {result?.meta?.coverageInfo && (
+                {/* Cycle Summary (swipes only) */}
+                {result.meta.cycleSummary && result.meta.cycleSummary.detectedCycles > 0 && (
+                  <div className="border-t border-gray-700/50 pt-2">
+                    <h4 className="text-xs font-medium text-gray-300 mb-1">サイクル詳細</h4>
+                    <p className="text-xs text-gray-400">
+                      採点対象: サイクル{result.meta.cycleSummary.selectedCycleIndex + 1}
+                      {result.meta.cycleSummary.cycleDurations.length > 0 && (
+                        <>
+                          {" / 各サイクル長: "}
+                          {result.meta.cycleSummary.cycleDurations.map(d => `${d.toFixed(2)}s`).join(", ")}
+                        </>
+                      )}
+                    </p>
+                  </div>
+                )}
+
+                {/* Event Summary (swipes only) */}
+                {result.meta.eventSummary && (
+                  result.meta.eventSummary.handPlantCount + result.meta.eventSummary.legSwingCount +
+                  result.meta.eventSummary.phaseChangeCount + result.meta.eventSummary.kickPeakCount > 0
+                ) && (
+                  <div className="border-t border-gray-700/50 pt-2">
+                    <h4 className="text-xs font-medium text-gray-300 mb-1">検出イベント</h4>
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-400">
+                      <span>手着き: {result.meta.eventSummary.handPlantCount}回</span>
+                      <span>脚振り: {result.meta.eventSummary.legSwingCount}回</span>
+                      <span>蹴りピーク: {result.meta.eventSummary.kickPeakCount}回</span>
+                      <span>フェーズ遷移: {result.meta.eventSummary.phaseChangeCount}回</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Scoring Window */}
+                {result.meta.selectedEvaluationWindow && (
+                  <div className="border-t border-gray-700/50 pt-2">
+                    <h4 className="text-xs font-medium text-gray-300 mb-1">採点した局面</h4>
+                    <p className="text-sm text-gray-400">
+                      {result.meta.sampling?.videoDuration != null
+                        ? `${result.meta.sampling.videoDuration.toFixed(1)}秒の動画のうち、`
+                        : ""}
+                      {result.meta.selectedEvaluationWindow.startTime.toFixed(1)}〜{result.meta.selectedEvaluationWindow.endTime.toFixed(1)}秒付近を主に採点
+                    </p>
+                    {result.meta.selectedReason && (
+                      <p className="text-xs text-gray-500 mt-0.5">{result.meta.selectedReason}</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Full Scan Fact */}
+                {result.meta.coverageInfo && (
+                  <div className="border-t border-gray-700/50 pt-2">
+                    <p className="text-xs text-gray-500">
+                      {result.meta.coverageInfo.fullScanPerformed
+                        ? `動画全体（${result.meta.coverageInfo.coarseScanTimeRange[0].toFixed(1)}〜${result.meta.coverageInfo.coarseScanTimeRange[1].toFixed(1)}秒）を走査したうえで、この局面を代表区間として選択しました。`
+                        : result.meta.coverageInfo.summary}
+                    </p>
+                  </div>
+                )}
+
+                {/* Simple Timeline Visualization */}
+                {result.meta.coverageInfo && result.meta.selectedEvaluationWindow && (() => {
+                  const ci = result.meta.coverageInfo!;
+                  const sw = result.meta.selectedEvaluationWindow!;
+                  const totalDuration = result.meta.sampling?.videoDuration ??
+                    ci.coarseScanTimeRange[1];
+                  if (totalDuration <= 0) return null;
+                  const scoringLeft = (sw.startTime / totalDuration) * 100;
+                  const scoringWidth = Math.max(2, ((sw.endTime - sw.startTime) / totalDuration) * 100);
+                  // Refine windows
+                  const refineWindows = result.meta.sampling?.selectedWindows ?? [];
+
+                  return (
+                    <div className="border-t border-gray-700/50 pt-2">
+                      <h4 className="text-xs font-medium text-gray-300 mb-2">解析タイムライン</h4>
+                      <div className="relative h-6 bg-gray-700/50 rounded-full overflow-hidden">
+                        {/* Full scan range (always full width) */}
+                        <div className="absolute inset-0 bg-gray-600/30 rounded-full"
+                          title="粗走査範囲（動画全体）" />
+                        {/* Refine windows */}
+                        {refineWindows.map((w, i) => {
+                          const left = (w.startTime / totalDuration) * 100;
+                          const width = Math.max(1, ((w.endTime - w.startTime) / totalDuration) * 100);
+                          return (
+                            <div key={i}
+                              className="absolute top-0 h-full bg-blue-500/20"
+                              style={{ left: `${left}%`, width: `${width}%` }}
+                              title={`重点分析: ${w.startTime.toFixed(1)}〜${w.endTime.toFixed(1)}秒`}
+                            />
+                          );
+                        })}
+                        {/* Scoring window */}
+                        <div
+                          className="absolute top-0 h-full bg-green-500/40 border-x border-green-400/60"
+                          style={{ left: `${scoringLeft}%`, width: `${scoringWidth}%` }}
+                          title={`採点区間: ${sw.startTime.toFixed(1)}〜${sw.endTime.toFixed(1)}秒`}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px] text-gray-500 mt-1">
+                        <span>0秒</span>
+                        <span>{totalDuration.toFixed(1)}秒</span>
+                      </div>
+                      <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-500">
+                        <span className="flex items-center gap-1">
+                          <span className="inline-block w-2 h-2 bg-gray-600/30 rounded-sm" />粗走査
+                        </span>
+                        {refineWindows.length > 0 && (
+                          <span className="flex items-center gap-1">
+                            <span className="inline-block w-2 h-2 bg-blue-500/20 rounded-sm" />重点分析
+                          </span>
+                        )}
+                        <span className="flex items-center gap-1">
+                          <span className="inline-block w-2 h-2 bg-green-500/40 rounded-sm" />採点区間
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+              );
+            })()}
+
+            {/* Quality Impact Summary — shown when there are impacts */}
+            {result?.meta?.qualityImpactSummary && result.meta.qualityImpactSummary.impacts.length > 0 && (
               <div className="rounded-xl p-4 border bg-gray-800/50 border-gray-700">
-                <h3 className="text-sm font-medium text-gray-300 mb-2">解析範囲</h3>
-                <p className="text-sm text-gray-400">
-                  {result.meta.coverageInfo.summary}
-                </p>
-                {result.meta.coverageInfo.finalScoringWindow && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    採点区間: {result.meta.coverageInfo.finalScoringWindow.startTime.toFixed(1)}〜{result.meta.coverageInfo.finalScoringWindow.endTime.toFixed(1)}秒
-                    （{result.meta.coverageInfo.finalScoringWindow.reason}）
-                  </p>
-                )}
-                {/* Sampling refinement windows */}
-                {result.meta.sampling && result.meta.sampling.selectedWindows.length > 0 && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    重点分析: {result.meta.sampling.selectedWindows.map(w => {
-                      const reasonJa = w.reason === "most_horizontal" ? "水平" :
-                        w.reason === "most_vertical" ? "垂直" :
-                        w.reason === "static_hold" ? "静止" :
-                        w.reason === "high_movement" ? "動き" : w.reason;
-                      return `${w.startTime.toFixed(1)}〜${w.endTime.toFixed(1)}秒（${reasonJa}, ${w.framesExtracted}フレーム）`;
-                    }).join("、")}
-                  </p>
-                )}
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-medium text-gray-300">品質影響</h3>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-gray-500">信頼度:</span>
+                    <div className="w-16 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full ${
+                          result.meta.qualityImpactSummary.reliability >= 0.8 ? "bg-green-400" :
+                          result.meta.qualityImpactSummary.reliability >= 0.6 ? "bg-yellow-400" :
+                          "bg-red-400"
+                        }`}
+                        style={{ width: `${result.meta.qualityImpactSummary.reliability * 100}%` }}
+                      />
+                    </div>
+                    <span className={`text-xs font-mono ${
+                      result.meta.qualityImpactSummary.reliability >= 0.8 ? "text-green-400" :
+                      result.meta.qualityImpactSummary.reliability >= 0.6 ? "text-yellow-400" :
+                      "text-red-400"
+                    }`}>
+                      {(result.meta.qualityImpactSummary.reliability * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  {result.meta.qualityImpactSummary.impacts.map((impact, i) => (
+                    <div key={i} className="text-xs text-gray-400 flex items-start gap-1.5">
+                      <span className={`mt-0.5 flex-shrink-0 w-1.5 h-1.5 rounded-full ${
+                        impact.reliabilityPenalty >= 0.2 ? "bg-red-400" :
+                        impact.reliabilityPenalty >= 0.1 ? "bg-yellow-400" :
+                        "bg-gray-500"
+                      }`} />
+                      <span>{impact.description}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -581,6 +772,20 @@ function AnalyzePage() {
                   })()}
                   <div>range: [{result.meta.analyzedFrameRange?.join("-")}]</div>
                   <div>totalF: {result.meta.totalFrames}</div>
+                  {result.meta.cycleSummary && (
+                    <>
+                      <div>cycles: {result.meta.cycleSummary.detectedCycles}</div>
+                      <div>selCyc: {result.meta.cycleSummary.selectedCycleIndex}</div>
+                    </>
+                  )}
+                  {result.meta.eventSummary && (
+                    <>
+                      <div>plant: {result.meta.eventSummary.handPlantCount}</div>
+                      <div>swing: {result.meta.eventSummary.legSwingCount}</div>
+                      <div>kick: {result.meta.eventSummary.kickPeakCount}</div>
+                      <div>phase: {result.meta.eventSummary.phaseChangeCount}</div>
+                    </>
+                  )}
                 </div>
                 {/* Entry frame details */}
                 {result.meta.entryFrameDetails && (
