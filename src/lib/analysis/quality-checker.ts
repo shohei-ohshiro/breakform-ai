@@ -224,6 +224,9 @@ function applyTechniqueRules(
     case "swipes":
       applySwipesRules(series, metrics, warnings, failureReasons);
       break;
+    case "middle_split":
+      applyMiddleSplitRules(series, warnings, failureReasons);
+      break;
   }
 }
 
@@ -321,5 +324,74 @@ function applySwipesRules(
   const lowWristRatio = lowWristVisCount / metrics.totalFrames;
   if (lowWristRatio > 0.3) {
     warnings.push("手首の検出精度が低いフレームが多いです。手がはっきり映るアングルで撮影してください");
+  }
+}
+
+/**
+ * Middle split (static image):
+ * - Front view recommended — detect via shoulder/hip z-spread.
+ * - Both feet must be inside the frame (hip/knee/ankle/foot_index visibility).
+ * - Pelvis region must be reasonably visible to trust proxies.
+ */
+function applyMiddleSplitRules(
+  series: PoseTimeSeries,
+  warnings: string[],
+  failureReasons: string[]
+): void {
+  const frame = series.frames[0];
+  if (!frame) return;
+  const lm = frame.landmarks;
+  if (lm.length < 33) return;
+
+  const lHip = lm[LM.LEFT_HIP];
+  const rHip = lm[LM.RIGHT_HIP];
+  const lKnee = lm[LM.LEFT_KNEE];
+  const rKnee = lm[LM.RIGHT_KNEE];
+  const lAnkle = lm[LM.LEFT_ANKLE];
+  const rAnkle = lm[LM.RIGHT_ANKLE];
+  const lFoot = lm[LM.LEFT_FOOT_INDEX];
+  const rFoot = lm[LM.RIGHT_FOOT_INDEX];
+  const lSh = lm[LM.LEFT_SHOULDER];
+  const rSh = lm[LM.RIGHT_SHOULDER];
+
+  // --- Hip visibility ---
+  const hipVis = (lHip.visibility + rHip.visibility) / 2;
+  if (hipVis < 0.4) {
+    failureReasons.push("骨盤付近の検出精度が極端に低いです。正面から骨盤がはっきり映るように撮影してください");
+  } else if (hipVis < 0.6) {
+    warnings.push("骨盤付近の検出がやや不安定です。タイトめの服装 or 正面からの撮影をおすすめします");
+  }
+
+  // --- Knee visibility ---
+  const kneeVis = (lKnee.visibility + rKnee.visibility) / 2;
+  if (kneeVis < 0.4) {
+    warnings.push("膝の検出精度が低いため、膝の伸びや脚ラインの判定が不安定になる可能性があります");
+  } else if (kneeVis < 0.6) {
+    warnings.push("膝の検出がやや不安定です");
+  }
+
+  // --- Foot in frame (both feet required) ---
+  const footInFrame = (foot: { x: number; y: number; visibility: number }) =>
+    foot.visibility >= 0.3 &&
+    foot.x >= -0.05 && foot.x <= 1.05 &&
+    foot.y >= -0.05 && foot.y <= 1.05;
+
+  const leftFootOk = footInFrame(lFoot) && footInFrame(lAnkle);
+  const rightFootOk = footInFrame(rFoot) && footInFrame(rAnkle);
+
+  if (!leftFootOk && !rightFootOk) {
+    failureReasons.push("両足先がフレーム外です。カメラを引いて、両足のつま先までフレーム内に収めてください");
+  } else if (!leftFootOk || !rightFootOk) {
+    warnings.push(`${leftFootOk ? "右" : "左"}足のつま先がフレーム外か、検出できていません。両足先までフレーム内に収めてください`);
+  }
+
+  // --- Frontality check ---
+  const shoulderZSpread = Math.abs(lSh.z - rSh.z);
+  const hipZSpread = Math.abs(lHip.z - rHip.z);
+  const frontality = Math.max(0, 1 - (shoulderZSpread + hipZSpread) * 2.5);
+  if (frontality < 0.5) {
+    warnings.push("正面から撮影されていない可能性があります。横開脚は正面視での計測をおすすめします");
+  } else if (frontality < 0.7) {
+    warnings.push("カメラアングルがやや斜めです。正面からまっすぐ撮影するとより正確な評価ができます");
   }
 }

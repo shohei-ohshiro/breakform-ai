@@ -6,6 +6,7 @@ import {
   makeHandstandLandmarks,
   makePlancheLandmarks,
   makeStandingLandmarks,
+  makeMiddleSplitLandmarks,
   makeImageSeries,
   makeVideoSeries,
 } from "./mock-data";
@@ -222,6 +223,82 @@ describe("SwipesEvaluator", () => {
       expect(v.threshold).toBeDefined();
       expect(typeof v.confidence).toBe("number");
     }
+  });
+});
+
+describe("MiddleSplitEvaluator", () => {
+  it("returns a score for a middle split image", () => {
+    const series = makeImageSeries(makeMiddleSplitLandmarks(170));
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized, "middle_split");
+    const result = evaluate("middle_split", normalized, features);
+
+    expect(result.technique).toBe("middle_split");
+    expect(result.finalScore).toBeGreaterThanOrEqual(0);
+    expect(result.finalScore).toBeLessThanOrEqual(100);
+    expect(result.breakdown.length).toBe(5);
+  });
+
+  it("scores a near-180° split higher than a 120° split", () => {
+    const wide = makeImageSeries(makeMiddleSplitLandmarks(175));
+    const wideNorm = normalizePoseTimeSeries(wide);
+    const wideFeats = extractFeatures(wideNorm, "middle_split");
+    const wideResult = evaluate("middle_split", wideNorm, wideFeats);
+
+    const narrow = makeImageSeries(makeMiddleSplitLandmarks(120));
+    const narrowNorm = normalizePoseTimeSeries(narrow);
+    const narrowFeats = extractFeatures(narrowNorm, "middle_split");
+    const narrowResult = evaluate("middle_split", narrowNorm, narrowFeats);
+
+    expect(wideResult.finalScore).toBeGreaterThan(narrowResult.finalScore);
+  });
+
+  it("computes split angle feature close to requested angle", () => {
+    const series = makeImageSeries(makeMiddleSplitLandmarks(160));
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized, "middle_split");
+
+    expect(features.middleSplit).toBeDefined();
+    expect(features.middleSplit!.splitAngleRaw).toBeGreaterThan(150);
+    expect(features.middleSplit!.splitAngleRaw).toBeLessThan(170);
+  });
+
+  it("produces breakdown categories for split_angle and pelvis_posture", () => {
+    const series = makeImageSeries(makeMiddleSplitLandmarks(160));
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized, "middle_split");
+    const result = evaluate("middle_split", normalized, features);
+
+    const categories = result.breakdown.map((b) => b.category);
+    expect(categories).toContain("split_angle");
+    expect(categories).toContain("pelvis_posture");
+    expect(categories).toContain("knee_extension");
+    expect(categories).toContain("symmetry");
+    expect(categories).toContain("trunk_compensation");
+  });
+
+  it("includes meta with middle_split configVersion", () => {
+    const series = makeImageSeries(makeMiddleSplitLandmarks(170));
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized, "middle_split");
+    const result = evaluate("middle_split", normalized, features);
+
+    expect(result.meta).toBeDefined();
+    expect(result.meta.configVersion).toBe("middle_split_1.0");
+    expect(result.meta.totalFrames).toBe(1);
+  });
+
+  it("raises violations for an insufficient split (100°)", () => {
+    const series = makeImageSeries(makeMiddleSplitLandmarks(100));
+    const normalized = normalizePoseTimeSeries(series);
+    const features = extractFeatures(normalized, "middle_split");
+    const result = evaluate("middle_split", normalized, features);
+
+    const splitAngleViolation = result.violations.find((v) =>
+      v.ruleId.startsWith("middle_split_angle"),
+    );
+    expect(splitAngleViolation).toBeDefined();
+    expect(result.suggestionsRaw.length).toBeGreaterThan(0);
   });
 });
 

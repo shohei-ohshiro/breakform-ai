@@ -7,6 +7,8 @@ import {
   FrameCoG,
   FrameVelocity,
   StaticInterval,
+  MiddleSplitFeatures,
+  TechniqueId,
   LM,
 } from "./types";
 
@@ -51,15 +53,19 @@ export function calcAngle(
 }
 
 /**
- * Extract complete feature set from normalized time series
+ * Extract complete feature set from normalized time series.
+ * When `technique` is provided, technique-specific features are also computed.
  */
-export function extractFeatures(series: NormalizedTimeSeries): FeatureSet {
+export function extractFeatures(
+  series: NormalizedTimeSeries,
+  technique?: TechniqueId,
+): FeatureSet {
   const angles = series.frames.map((f) => computeFrameAngles(f));
   const cog = series.frames.map((f) => computeFrameCoG(f));
   const velocities = computeVelocities(series);
   const staticIntervals = detectStaticIntervals(series, velocities);
 
-  return {
+  const base: FeatureSet = {
     angles,
     cog,
     velocities,
@@ -67,6 +73,12 @@ export function extractFeatures(series: NormalizedTimeSeries): FeatureSet {
     frameCount: series.frames.length,
     duration: series.duration,
   };
+
+  if (technique === "middle_split" && series.frames.length > 0) {
+    base.middleSplit = computeMiddleSplitFeatures(series.frames[0], angles[0]);
+  }
+
+  return base;
 }
 
 function computeFrameAngles(frame: NormalizedFrame): FrameAngles {
@@ -294,4 +306,207 @@ function detectStaticIntervals(
   }
 
   return intervals;
+}
+
+// ---------------------------------------------------------------------------
+// Middle split feature extraction
+// ---------------------------------------------------------------------------
+
+const RAD_TO_DEG = 180 / Math.PI;
+
+/** Angle between two 2D vectors, in degrees [0, 180]. */
+function angleBetween2D(
+  ax: number, ay: number,
+  bx: number, by: number,
+): number {
+  const aMag = Math.hypot(ax, ay);
+  const bMag = Math.hypot(bx, by);
+  if (aMag < 1e-6 || bMag < 1e-6) return 0;
+  const cos = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (aMag * bMag)));
+  return Math.acos(cos) * RAD_TO_DEG;
+}
+
+/** Angle of a vector from horizontal (positive x-axis), in degrees [0, 90]. */
+function elevationFromHorizon(dx: number, dy: number): number {
+  const mag = Math.hypot(dx, dy);
+  if (mag < 1e-6) return 0;
+  return Math.abs(Math.atan2(dy, Math.abs(dx))) * RAD_TO_DEG;
+}
+
+/** Line(hip-knee-ankle) deviation from 180° (a straight line). */
+function legLineDeviation(
+  hip: NormalizedLandmark,
+  knee: NormalizedLandmark,
+  ankle: NormalizedLandmark,
+): number {
+  const a = calcAngle(hip, knee, ankle);
+  return Math.abs(180 - a);
+}
+
+/**
+ * Compute middle split specific features from a single normalized frame.
+ *
+ * Coordinate system reminder:
+ *   Origin = hip midpoint, scale = shoulder width, Y-axis positive = UP.
+ */
+export function computeMiddleSplitFeatures(
+  frame: NormalizedFrame,
+  frameAngles: FrameAngles,
+): MiddleSplitFeatures {
+  const lm = frame.landmarks;
+
+  const lHip = lm[LM.LEFT_HIP];
+  const rHip = lm[LM.RIGHT_HIP];
+  const lKnee = lm[LM.LEFT_KNEE];
+  const rKnee = lm[LM.RIGHT_KNEE];
+  const lAnkle = lm[LM.LEFT_ANKLE];
+  const rAnkle = lm[LM.RIGHT_ANKLE];
+  const lFoot = lm[LM.LEFT_FOOT_INDEX];
+  const rFoot = lm[LM.RIGHT_FOOT_INDEX];
+  const lShoulder = lm[LM.LEFT_SHOULDER];
+  const rShoulder = lm[LM.RIGHT_SHOULDER];
+
+  // Leg vectors (hip → ankle)
+  const lLegVx = lAnkle.x - lHip.x;
+  const lLegVy = lAnkle.y - lHip.y;
+  const rLegVx = rAnkle.x - rHip.x;
+  const rLegVy = rAnkle.y - rHip.y;
+
+  // Thigh vectors (hip → knee) — used to isolate knee-bend compensation
+  const lThighVx = lKnee.x - lHip.x;
+  const lThighVy = lKnee.y - lHip.y;
+  const rThighVx = rKnee.x - rHip.x;
+  const rThighVy = rKnee.y - rHip.y;
+
+  const splitAngleRaw = angleBetween2D(lLegVx, lLegVy, rLegVx, rLegVy);
+  const splitAngleHipKnee = angleBetween2D(
+    lThighVx, lThighVy, rThighVx, rThighVy,
+  );
+
+  const leftLegAngleFromHorizon = elevationFromHorizon(lLegVx, lLegVy);
+  const rightLegAngleFromHorizon = elevationFromHorizon(rLegVx, rLegVy);
+  const leftRightAngleDiff = Math.abs(
+    leftLegAngleFromHorizon - rightLegAngleFromHorizon,
+  );
+
+  // Pelvis roll — angle of hip line from horizontal
+  const hipDx = rHip.x - lHip.x;
+  const hipDy = rHip.y - lHip.y;
+  const pelvisRollAngle = Math.abs(
+    Math.atan2(hipDy, hipDx) * RAD_TO_DEG,
+  );
+
+  // Trunk lean from vertical (image plane).
+  // hip midpoint is origin → shoulder midpoint gives the trunk vector.
+  const shMidX = (lShoulder.x + rShoulder.x) / 2;
+  const shMidY = (lShoulder.y + rShoulder.y) / 2;
+  const trunkLeanAngle = Math.abs(
+    Math.atan2(shMidX, Math.abs(shMidY)) * RAD_TO_DEG,
+  );
+  // Signed version used by pelvis tilt (retains left/right sign info)
+  const pelvisTiltProxy = Math.atan2(shMidX, Math.abs(shMidY)) * RAD_TO_DEG;
+
+  // Shoulder vs hip depth (z) proxy for anterior/posterior pelvic tilt
+  const shMidZ = (lShoulder.z + rShoulder.z) / 2;
+  const hipMidZ = (lHip.z + rHip.z) / 2;
+  const pelvisTiltZProxy = shMidZ - hipMidZ;
+
+  // Knee extension: 180° = straight
+  const leftKneeExtension = frameAngles.leftKnee;
+  const rightKneeExtension = frameAngles.rightKnee;
+  const kneeExtensionAvg = (leftKneeExtension + rightKneeExtension) / 2;
+  const kneeExtensionAsymmetry = Math.abs(
+    leftKneeExtension - rightKneeExtension,
+  );
+
+  const leftLegLineDeviation = legLineDeviation(lHip, lKnee, lAnkle);
+  const rightLegLineDeviation = legLineDeviation(rHip, rKnee, rAnkle);
+
+  // Turnout proxy: angle between foot vector (ankle→foot_index) and thigh vector (hip→knee).
+  // Same for both legs — we ignore sign since we only care about how much the
+  // foot deviates from the leg line.
+  const leftFootDx = lFoot.x - lAnkle.x;
+  const leftFootDy = lFoot.y - lAnkle.y;
+  const rightFootDx = rFoot.x - rAnkle.x;
+  const rightFootDy = rFoot.y - rAnkle.y;
+  const leftFootTurnoutProxy = angleBetween2D(
+    leftFootDx, leftFootDy, lThighVx, lThighVy,
+  );
+  const rightFootTurnoutProxy = angleBetween2D(
+    rightFootDx, rightFootDy, rThighVx, rThighVy,
+  );
+  const turnoutAsymmetry = Math.abs(
+    leftFootTurnoutProxy - rightFootTurnoutProxy,
+  );
+
+  // Trunk lean direction (coarse — only one dominant axis)
+  let trunkLeanDirection: MiddleSplitFeatures["trunkLeanDirection"] = "upright";
+  if (trunkLeanAngle >= 8) {
+    if (Math.abs(pelvisTiltZProxy) > 0.15) {
+      trunkLeanDirection = pelvisTiltZProxy > 0 ? "back" : "forward";
+    } else if (shMidX > 0.08) {
+      trunkLeanDirection = "right";
+    } else if (shMidX < -0.08) {
+      trunkLeanDirection = "left";
+    }
+  }
+
+  // Frontality: small absolute z difference between shoulders and hips = frontal.
+  const shoulderZSpread = Math.abs(lShoulder.z - rShoulder.z);
+  const hipZSpread = Math.abs(lHip.z - rHip.z);
+  const frontalityScore = Math.max(
+    0,
+    1 - (shoulderZSpread + hipZSpread) * 2.5,
+  );
+
+  const visValues = [
+    lHip.visibility, rHip.visibility,
+    lKnee.visibility, rKnee.visibility,
+    lAnkle.visibility, rAnkle.visibility,
+    lFoot.visibility, rFoot.visibility,
+  ];
+  const keyLandmarkVisibility =
+    visValues.reduce((s, v) => s + v, 0) / visValues.length;
+
+  return {
+    splitAngleRaw: round1(splitAngleRaw),
+    splitAngleHipKnee: round1(splitAngleHipKnee),
+    leftLegAngleFromHorizon: round1(leftLegAngleFromHorizon),
+    rightLegAngleFromHorizon: round1(rightLegAngleFromHorizon),
+    leftRightAngleDiff: round1(leftRightAngleDiff),
+    pelvisRollAngle: round1(pelvisRollAngle),
+    pelvisTiltProxy: round1(pelvisTiltProxy),
+    pelvisTiltZProxy: Math.round(pelvisTiltZProxy * 1000) / 1000,
+    leftKneeExtension: round1(leftKneeExtension),
+    rightKneeExtension: round1(rightKneeExtension),
+    kneeExtensionAvg: round1(kneeExtensionAvg),
+    kneeExtensionAsymmetry: round1(kneeExtensionAsymmetry),
+    leftLegLineDeviation: round1(leftLegLineDeviation),
+    rightLegLineDeviation: round1(rightLegLineDeviation),
+    leftFootTurnoutProxy: round1(leftFootTurnoutProxy),
+    rightFootTurnoutProxy: round1(rightFootTurnoutProxy),
+    turnoutAsymmetry: round1(turnoutAsymmetry),
+    trunkLeanAngle: round1(trunkLeanAngle),
+    trunkLeanDirection,
+    frontalityScore: Math.round(frontalityScore * 100) / 100,
+    keyLandmarkVisibility: Math.round(keyLandmarkVisibility * 100) / 100,
+    landmarkVisibility: {
+      leftHip: round2(lHip.visibility),
+      rightHip: round2(rHip.visibility),
+      leftKnee: round2(lKnee.visibility),
+      rightKnee: round2(rKnee.visibility),
+      leftAnkle: round2(lAnkle.visibility),
+      rightAnkle: round2(rAnkle.visibility),
+      leftFootIndex: round2(lFoot.visibility),
+      rightFootIndex: round2(rFoot.visibility),
+    },
+  };
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }

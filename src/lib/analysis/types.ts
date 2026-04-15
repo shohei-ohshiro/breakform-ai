@@ -150,6 +150,62 @@ export interface FeatureSet {
   staticIntervals: StaticInterval[];
   frameCount: number;
   duration: number;
+  /** Technique-specific extra features (populated only for that technique). */
+  middleSplit?: MiddleSplitFeatures;
+}
+
+/**
+ * Middle split specific features, computed from a single representative frame.
+ * All angles in degrees. "Proxy" means estimated from image-plane geometry —
+ * these are indicators of posture, NOT medical measurements of joint ROM.
+ */
+export interface MiddleSplitFeatures {
+  /** Angle between left and right leg vectors (hip→ankle). 180° = full split. */
+  splitAngleRaw: number;
+  /** Same as above but using hip→knee — used to separate knee-bend compensation. */
+  splitAngleHipKnee: number;
+  /** Left leg angle above horizontal (0°=flat on floor, 90°=vertical up). */
+  leftLegAngleFromHorizon: number;
+  rightLegAngleFromHorizon: number;
+  /** abs(left - right) leg-from-horizon angle. */
+  leftRightAngleDiff: number;
+  /** Hip-line roll vs horizontal. */
+  pelvisRollAngle: number;
+  /** Shoulder–hip vector tilt from vertical (image plane proxy, signed). */
+  pelvisTiltProxy: number;
+  /** Shoulder Z − Hip Z (MediaPipe z). Positive = shoulders behind hips proxy. */
+  pelvisTiltZProxy: number;
+  /** Knee joint angle (hip-knee-ankle), ~180° = straight. */
+  leftKneeExtension: number;
+  rightKneeExtension: number;
+  kneeExtensionAvg: number;
+  kneeExtensionAsymmetry: number;
+  /** Deviation from 180° for the hip-knee-ankle line. */
+  leftLegLineDeviation: number;
+  rightLegLineDeviation: number;
+  /** Angle between foot-index vector and thigh vector — turnout proxy. */
+  leftFootTurnoutProxy: number;
+  rightFootTurnoutProxy: number;
+  turnoutAsymmetry: number;
+  /** Trunk angle from vertical (any direction, unsigned). */
+  trunkLeanAngle: number;
+  /** Predominant direction the trunk leans. */
+  trunkLeanDirection: "upright" | "left" | "right" | "forward" | "back";
+  /** 0–1, how "frontal" the view looks (smaller z spread = more frontal). */
+  frontalityScore: number;
+  /** Average visibility of hip/knee/ankle/foot_index. */
+  keyLandmarkVisibility: number;
+  /** Per-landmark visibility for debug. */
+  landmarkVisibility: {
+    leftHip: number;
+    rightHip: number;
+    leftKnee: number;
+    rightKnee: number;
+    leftAnkle: number;
+    rightAnkle: number;
+    leftFootIndex: number;
+    rightFootIndex: number;
+  };
 }
 
 /** A detected interval where the pose is roughly static */
@@ -193,6 +249,7 @@ export interface FeatureSetJSON {
   staticIntervals: StaticInterval[];
   frameCount: number;
   duration: number;
+  middleSplit?: MiddleSplitFeatures;
 }
 
 export function featureSetToJSON(fs: FeatureSet): FeatureSetJSON {
@@ -200,7 +257,16 @@ export function featureSetToJSON(fs: FeatureSet): FeatureSetJSON {
   for (const [key, value] of fs.velocities) {
     velocities[String(key)] = value;
   }
-  return { ...fs, velocities };
+  const json: FeatureSetJSON = {
+    angles: fs.angles,
+    cog: fs.cog,
+    velocities,
+    staticIntervals: fs.staticIntervals,
+    frameCount: fs.frameCount,
+    duration: fs.duration,
+  };
+  if (fs.middleSplit) json.middleSplit = fs.middleSplit;
+  return json;
 }
 
 // ============================================
@@ -306,7 +372,7 @@ export interface CoverageInfo {
 // Evaluation (Rule-based)
 // ============================================
 
-export type TechniqueId = "handstand" | "planche" | "swipes";
+export type TechniqueId = "handstand" | "planche" | "swipes" | "middle_split";
 
 export type RuleStatus = "pass" | "warn" | "fail";
 
@@ -480,7 +546,18 @@ export interface QualityImpactSummary {
 
 export interface QualityImpact {
   /** Warning category */
-  category: "subject_size" | "visibility" | "skeleton_gap" | "out_of_frame" | "short_hold" | "frame_instability" | "motion_blur" | "low_cycle_clarity";
+  category:
+    | "subject_size"
+    | "visibility"
+    | "skeleton_gap"
+    | "out_of_frame"
+    | "short_hold"
+    | "frame_instability"
+    | "motion_blur"
+    | "low_cycle_clarity"
+    | "frontality_low"
+    | "foot_out_of_frame"
+    | "pelvis_unstable";
   /** Human-readable impact description */
   description: string;
   /** How much this warning reduced reliability (0-1) */
@@ -543,6 +620,91 @@ export interface GeneratedAdvice {
 /** 3-level quality classification for UI display */
 export type QualityLevel = "good" | "reference" | "retry";
 
+/**
+ * Versioned, structured result summary that UI / history / Claude API all read.
+ * This is the canonical form; free-text `summary` is derived from it.
+ */
+export interface StructuredSummary {
+  version: "middle_split_summary_v1";
+
+  currentStateSummary: {
+    headline: string;
+    score: number;
+    mainMetric: {
+      label: string;
+      value: number;
+      unit: string;
+      target: number;
+      progressRatio: number;
+    };
+    positiveNotes: string[];
+  };
+
+  primaryLimiters: Array<{
+    id: string;
+    label: string;
+    severity: "minor" | "major" | "critical";
+    finding: string;
+    evidence: {
+      metric: string;
+      value: number;
+      unit: string;
+      threshold?: { warn: number; fail: number };
+    };
+    estimatedImpact: number;
+  }>;
+
+  improvementPriorities: Array<{
+    forLimiterId: string;
+    focus: string;
+    practice: string;
+    durationHint: string;
+  }>;
+
+  reliabilitySummary: {
+    overall: number;
+    level: QualityLevel;
+    factors: Array<{
+      name: string;
+      score: number;
+    }>;
+    note: string;
+  };
+
+  retakeAdvice: {
+    recommended: boolean;
+    urgency: "none" | "suggested" | "required";
+    reasons: RetakeReason[];
+  };
+
+  mainFindings: string[];
+
+  meta: {
+    technique: TechniqueId;
+    evaluatorVersion: string;
+    configVersion: string;
+    generatedAt: string;
+  };
+}
+
+/** Structured reason for recommending a retake — surfaced on the result UI. */
+export interface RetakeReason {
+  /** Stable code for analytics & conditional UI logic */
+  code:
+    | "low_frontality"
+    | "low_visibility"
+    | "landmark_missing"
+    | "image_cropped"
+    | "subject_too_small"
+    | "short_hold"
+    | "insufficient_frames"
+    | "low_reliability";
+  /** User-facing message (already sanitized for middle_split) */
+  message: string;
+  /** Concrete fix the user can apply next time */
+  howToFix: string;
+}
+
 // ============================================
 // Full Pipeline Result
 // ============================================
@@ -576,6 +738,38 @@ export interface PipelineResult {
   // Quality level for UI display
   qualityLevel: QualityLevel;
   qualityExplanation: string;
+  /** Overall reliability (0..1) derived from quality + impact summary. */
+  reliability: number;
+  /** Whether UI should nudge the user to retake the photo/video. */
+  retakeRecommended: boolean;
+  /** Structured reasons for the retake nudge (empty when not recommended). */
+  retakeReasons: RetakeReason[];
+  /** Versioned structured summary (middle_split only for now, extensible). */
+  structuredSummary?: StructuredSummary;
+}
+
+// ============================================
+// API Error Codes
+// ============================================
+
+/**
+ * Stable error codes returned by the /api/analyze endpoint.
+ * The client keys UX decisions off these codes, not off the free-text message.
+ */
+export type ErrorCode =
+  | "missing_fields"
+  | "unsupported_technique"
+  | "usage_limit_exceeded"
+  | "api_key_missing"
+  | "quality_too_low"
+  | "pipeline_error"
+  | "unknown_error";
+
+export interface ApiErrorResponse {
+  error: string;
+  errorCode: ErrorCode;
+  /** Optional structured detail (e.g., usage limits for "usage_limit_exceeded") */
+  detail?: Record<string, unknown>;
 }
 
 // ============================================

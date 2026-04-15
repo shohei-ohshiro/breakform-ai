@@ -8,6 +8,7 @@ import {
 import { evaluateHandstand } from "./handstand";
 import { evaluatePlanche } from "./planche";
 import { evaluateSwipes } from "./swipes";
+import { evaluateMiddleSplit } from "./middleSplit";
 
 type EvaluatorFn = (
   series: NormalizedTimeSeries,
@@ -19,6 +20,7 @@ const EVALUATORS: Record<TechniqueId, EvaluatorFn> = {
   handstand: evaluateHandstand,
   planche: evaluatePlanche,
   swipes: evaluateSwipes,
+  middle_split: evaluateMiddleSplit,
 };
 
 export function evaluate(

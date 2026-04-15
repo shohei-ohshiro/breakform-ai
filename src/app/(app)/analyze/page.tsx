@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect, Fragment, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
-import { Loader2, Zap, Info, AlertTriangle, ChevronDown, ChevronUp, Bug } from "lucide-react";
+import { Loader2, Zap, Info, AlertTriangle, ChevronDown, ChevronUp, Bug, Camera } from "lucide-react";
 import Link from "next/link";
 import VideoUploader from "@/components/analysis/VideoUploader";
 import TrickSelector from "@/components/analysis/TrickSelector";
@@ -15,8 +15,11 @@ import {
   AnalysisResult,
   AnalysisState,
 } from "@/lib/types";
-import { detectPoseFromImage, extractPoseTimeSeries, TimestampMismatchError } from "@/lib/pose/mediapipe";
-import { TechniqueId, SamplingInfo } from "@/lib/analysis/types";
+import { detectPoseFromImage, extractPoseTimeSeries, TimestampMismatchError, captureVideoFrameToCanvas } from "@/lib/pose/mediapipe";
+import { TechniqueId, SamplingInfo, StructuredSummary, RetakeReason, ErrorCode } from "@/lib/analysis/types";
+import { runPreCaptureCheck, PreCaptureCheckResult } from "@/lib/analysis/preCaptureCheck";
+import { addHistoryEntry } from "@/lib/analysis/history";
+import { isFeatureEnabled } from "@/lib/featureFlags";
 
 const STATE_MESSAGES: Record<AnalysisState, string> = {
   idle: "",
@@ -166,6 +169,10 @@ interface ExtendedResult extends AnalysisResult {
       }[];
     };
   };
+  reliability?: number;
+  retakeRecommended?: boolean;
+  retakeReasons?: RetakeReason[];
+  structuredSummary?: StructuredSummary;
   // Build info (always returned)
   buildInfo?: {
     appVersion: string;
@@ -198,6 +205,10 @@ function AnalyzePage() {
   const [landmarks, setLandmarks] = useState<Landmark[] | null>(null);
   const [result, setResult] = useState<ExtendedResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<ErrorCode | null>(null);
+  const [preCheck, setPreCheck] = useState<PreCaptureCheckResult | null>(null);
+  const [preCheckState, setPreCheckState] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [overridePreCheck, setOverridePreCheck] = useState(false);
   const [progress, setProgress] = useState<string>("");
   const [usage, setUsage] = useState<{
     remaining: number;
@@ -213,6 +224,71 @@ function AnalyzePage() {
       .catch(() => {});
   }, []);
 
+  // Pre-capture quality check — runs once the user has chosen BOTH a file and a trick.
+  // Detects a single frame locally (no quota) and surfaces obvious retake warnings early.
+  useEffect(() => {
+    if (!isFeatureEnabled("middle_split_precapture_check")) return;
+    if (!file || !selectedTrick || preCheckState === "running") return;
+    if (preCheck !== null) return;
+    if (state === "detecting" || state === "analyzing") return;
+
+    let cancelled = false;
+    const run = async () => {
+      setPreCheckState("running");
+      try {
+        let checkLandmarks: Landmark[] | null = null;
+
+        if (file.type.startsWith("video/")) {
+          const video = document.getElementById("uploaded-video") as HTMLVideoElement | null;
+          if (!video) {
+            setPreCheckState("error");
+            return;
+          }
+          if (video.readyState < 2) {
+            await new Promise<void>((resolve) => {
+              const onReady = () => {
+                video.removeEventListener("loadeddata", onReady);
+                resolve();
+              };
+              video.addEventListener("loadeddata", onReady);
+            });
+          }
+          const canvas = captureVideoFrameToCanvas(video);
+          if (!canvas) {
+            setPreCheckState("error");
+            return;
+          }
+          checkLandmarks = await detectPoseFromImage(canvas);
+        } else {
+          const img = document.getElementById("uploaded-image") as HTMLImageElement | null;
+          if (!img) {
+            setPreCheckState("error");
+            return;
+          }
+          if (!img.complete) {
+            await new Promise<void>((resolve) => {
+              img.onload = () => resolve();
+            });
+          }
+          checkLandmarks = await detectPoseFromImage(img);
+        }
+
+        if (cancelled) return;
+        const result = runPreCaptureCheck(checkLandmarks, selectedTrick.id as TechniqueId);
+        setPreCheck(result);
+        setPreCheckState("done");
+      } catch (err) {
+        console.error("Pre-capture check failed:", err);
+        if (!cancelled) setPreCheckState("error");
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [file, selectedTrick, preCheck, preCheckState, state]);
+
   const [videoDuration, setVideoDuration] = useState<number>(0);
 
   const handleFileSelected = useCallback((f: File, url: string) => {
@@ -221,9 +297,13 @@ function AnalyzePage() {
     setLandmarks(null);
     setResult(null);
     setError(null);
+    setErrorCode(null);
     setProgress("");
     setState("idle");
     setVideoDuration(0);
+    setPreCheck(null);
+    setPreCheckState("idle");
+    setOverridePreCheck(false);
 
     // If video, read duration for long-video warning
     if (f.type.startsWith("video/")) {
@@ -241,6 +321,7 @@ function AnalyzePage() {
     if (!file || !selectedTrick || !previewUrl) return;
 
     setError(null);
+    setErrorCode(null);
     setResult(null);
 
     try {
@@ -344,7 +425,12 @@ function AnalyzePage() {
       });
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => null);
+        const errData: { error?: string; errorCode?: ErrorCode } | null = await response
+          .json()
+          .catch(() => null);
+        if (errData?.errorCode) {
+          setErrorCode(errData.errorCode);
+        }
         throw new Error(
           errData?.error || "分析に失敗しました。もう一度お試しください。"
         );
@@ -353,6 +439,18 @@ function AnalyzePage() {
       const analysisResult: ExtendedResult = await response.json();
       setResult(analysisResult);
       setState("complete");
+
+      if (selectedTrick) {
+        addHistoryEntry({
+          technique: selectedTrick.id as TechniqueId,
+          trickNameJa: selectedTrick.name_ja,
+          score: analysisResult.score ?? 0,
+          qualityLevel: analysisResult.qualityLevel ?? "reference",
+          reliability: analysisResult.reliability ?? 0,
+          headline: analysisResult.structuredSummary?.currentStateSummary.headline,
+          topLimiter: analysisResult.structuredSummary?.primaryLimiters[0]?.label,
+        });
+      }
 
       // Refresh usage
       fetch("/api/usage")
@@ -374,7 +472,11 @@ function AnalyzePage() {
 
   const [showDebug, setShowDebug] = useState(false);
   const isAnalyzing = state === "detecting" || state === "analyzing";
-  const canAnalyze = !!file && !!selectedTrick && !isAnalyzing;
+  const preCheckBlocks =
+    isFeatureEnabled("middle_split_precapture_check") &&
+    preCheck?.blocked === true &&
+    !overridePreCheck;
+  const canAnalyze = !!file && !!selectedTrick && !isAnalyzing && !preCheckBlocks;
 
   return (
     <div className="min-h-screen bg-gray-950">
@@ -442,6 +544,31 @@ function AnalyzePage() {
               onSelect={setSelectedTrick}
             />
 
+            {/* Capture guidance per technique */}
+            {selectedTrick?.captureGuidance_ja && (
+              <div className="flex items-start gap-2 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-sm text-blue-200">
+                <Camera className="w-4 h-4 flex-shrink-0 mt-0.5 text-blue-300" />
+                <div>
+                  <p className="font-medium text-blue-300">
+                    撮影のポイント
+                  </p>
+                  <p className="text-blue-200/80 text-xs mt-1 leading-relaxed">
+                    {selectedTrick.captureGuidance_ja}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Pre-capture quality check — runs locally, never spends quota */}
+            {file && selectedTrick && isFeatureEnabled("middle_split_precapture_check") && (
+              <PreCaptureCard
+                state={preCheckState}
+                result={preCheck}
+                overridden={overridePreCheck}
+                onOverride={() => setOverridePreCheck(true)}
+              />
+            )}
+
             {/* Long video warning */}
             {videoDuration > 15 && (
               <div className="flex items-start gap-2 p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg text-sm text-orange-300">
@@ -482,8 +609,12 @@ function AnalyzePage() {
             </button>
 
             {error && (
-              <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
-                {error}
+              <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm space-y-1">
+                <p>{error}</p>
+                {errorCode && <ErrorCodeHint code={errorCode} />}
+                {errorCode && (
+                  <p className="text-[10px] text-red-400/50 font-mono">code: {errorCode}</p>
+                )}
               </div>
             )}
           </div>
@@ -820,6 +951,13 @@ function AnalyzePage() {
               </div>
             )}
 
+            {/* Middle Split — structured summary driven layout */}
+            {selectedTrick?.id === "middle_split" &&
+              result?.structuredSummary &&
+              isFeatureEnabled("middle_split_structured_summary") && (
+                <MiddleSplitSummaryPanel summary={result.structuredSummary} />
+              )}
+
             {/* Score Breakdown */}
             {result?.breakdown && result.breakdown.length > 0 && (
               <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
@@ -974,18 +1112,347 @@ function AnalyzePage() {
           </div>
         )}
 
-        {/* Build Info Footer */}
+        {/* Build Info Footer — prefers server-returned buildInfo (actual version that scored this result) */}
         <div className={`mt-8 pb-4 text-center ${isDebugMode ? "text-[11px] text-purple-400/60" : "text-[10px] text-gray-600"}`}>
-          <span>v{process.env.NEXT_PUBLIC_APP_VERSION ?? "?"}</span>
+          <span>
+            v{result?.buildInfo?.appVersion ?? process.env.NEXT_PUBLIC_APP_VERSION ?? "?"}
+          </span>
           <span className="mx-1">·</span>
-          <span>{process.env.NEXT_PUBLIC_BUILD_ID ?? "dev"}</span>
+          <span>{result?.buildInfo?.buildId ?? process.env.NEXT_PUBLIC_BUILD_ID ?? "dev"}</span>
+          {result?.buildInfo?.evaluatorConfigVersion && (
+            <>
+              <span className="mx-1">·</span>
+              <span>eval {result.buildInfo.evaluatorConfigVersion}</span>
+            </>
+          )}
           {isDebugMode && (
             <>
               <span className="mx-1">·</span>
-              <span>{process.env.NEXT_PUBLIC_BUILD_TIME ?? "local"}</span>
+              <span>{result?.buildInfo?.buildTime ?? process.env.NEXT_PUBLIC_BUILD_TIME ?? "local"}</span>
+              {result?.buildInfo && (
+                <>
+                  <span className="mx-1">·</span>
+                  <span>
+                    client {process.env.NEXT_PUBLIC_BUILD_ID ?? "dev"}
+                  </span>
+                </>
+              )}
             </>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Pre-capture quality check card.
+ * Shows a running/done/error state plus any issues surfaced by the
+ * client-side heuristic. A "block" severity gates the analyze button
+ * unless the user explicitly overrides.
+ */
+function PreCaptureCard({
+  state,
+  result,
+  overridden,
+  onOverride,
+}: {
+  state: "idle" | "running" | "done" | "error";
+  result: PreCaptureCheckResult | null;
+  overridden: boolean;
+  onOverride: () => void;
+}) {
+  if (state === "idle") {
+    return null;
+  }
+  if (state === "running") {
+    return (
+      <div className="flex items-center gap-2 p-3 rounded-lg border bg-gray-800/40 border-gray-700 text-xs text-gray-400">
+        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        事前チェック中…
+      </div>
+    );
+  }
+  if (state === "error" || !result) {
+    return (
+      <div className="p-3 rounded-lg border bg-gray-800/40 border-gray-700 text-xs text-gray-400">
+        事前チェックをスキップしました（分析は続行できます）
+      </div>
+    );
+  }
+
+  if (result.passed) {
+    return (
+      <div className="flex items-center gap-2 p-3 rounded-lg border bg-green-500/10 border-green-500/30 text-xs text-green-300">
+        <Info className="w-3.5 h-3.5" />
+        事前チェック OK — 人物検出
+        {Math.round(result.avgVisibility * 100)}%。そのまま分析できます。
+      </div>
+    );
+  }
+
+  const blocked = result.blocked && !overridden;
+  const tone = blocked
+    ? "bg-red-500/10 border-red-500/30 text-red-200"
+    : "bg-yellow-500/10 border-yellow-500/30 text-yellow-200";
+  const title = blocked ? "この動画/画像は分析に向かない可能性があります" : "事前チェックで注意点が見つかりました";
+
+  return (
+    <div className={`p-3 rounded-lg border space-y-2 ${tone}`}>
+      <div className="flex items-center gap-2">
+        <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+        <p className="text-sm font-medium">{title}</p>
+      </div>
+      <ul className="space-y-1.5 text-xs">
+        {result.issues.map((i) => (
+          <li key={i.code}>
+            <p className="font-medium">
+              ・{i.message}
+              {i.severity === "block" && (
+                <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-red-500/30 border border-red-500/50">
+                  重大
+                </span>
+              )}
+            </p>
+            <p className="opacity-80 ml-3 mt-0.5 leading-relaxed">{i.howToFix}</p>
+          </li>
+        ))}
+      </ul>
+      {blocked && (
+        <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
+          <p className="text-[11px] opacity-80">
+            撮影し直すと分析回数を消費せずに改善できます。
+          </p>
+          <button
+            onClick={onOverride}
+            className="text-[11px] underline opacity-80 hover:opacity-100"
+          >
+            このまま分析する
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Maps an ErrorCode to concrete next-step guidance the user can act on.
+ * Keeps error-message free text separate from actionable hints.
+ */
+function ErrorCodeHint({ code }: { code: ErrorCode }) {
+  const hint: Record<ErrorCode, string> = {
+    missing_fields:
+      "入力データが正しく送れていません。ページを再読み込みして、もう一度試してください。",
+    unsupported_technique:
+      "この技はまだ対応していません。対応済みの技を選び直してください。",
+    usage_limit_exceeded:
+      "今月の無料分析回数を使い切りました。有料プランにアップグレードするか、翌月までお待ちください。",
+    api_key_missing:
+      "サーバー側の設定に不備があります。管理者にお問い合わせください。",
+    quality_too_low:
+      "撮影品質が足りませんでした。明るい場所で全身が映るよう撮影し直してください。",
+    pipeline_error:
+      "分析処理で一時的なエラーが発生しました。しばらく待ってから再度お試しください。",
+    unknown_error:
+      "予期せぬエラーが発生しました。時間をおいて再度お試しください。",
+  };
+  return <p className="text-xs text-red-300/80">{hint[code]}</p>;
+}
+
+/**
+ * Structured summary panel for middle_split results.
+ * Reads the canonical StructuredSummary and renders: 現状→主な課題→練習→信頼度/retake.
+ */
+function MiddleSplitSummaryPanel({ summary }: { summary: StructuredSummary }) {
+  const { currentStateSummary, primaryLimiters, improvementPriorities, reliabilitySummary, retakeAdvice } = summary;
+  const main = currentStateSummary.mainMetric;
+  const progressPct = Math.min(100, Math.max(0, main.progressRatio * 100));
+
+  const angleColor =
+    main.value >= 170
+      ? "text-green-400"
+      : main.value >= 150
+        ? "text-yellow-400"
+        : main.value >= 120
+          ? "text-orange-400"
+          : "text-red-400";
+  const barColor =
+    main.value >= 170
+      ? "bg-green-400"
+      : main.value >= 150
+        ? "bg-yellow-400"
+        : main.value >= 120
+          ? "bg-orange-400"
+          : "bg-red-400";
+
+  const sevColor = (sev: "minor" | "major" | "critical") =>
+    sev === "critical" ? "text-red-400" : sev === "major" ? "text-yellow-400" : "text-gray-400";
+  const sevBadge = (sev: "minor" | "major" | "critical") =>
+    sev === "critical"
+      ? "bg-red-500/20 border-red-500/40 text-red-300"
+      : sev === "major"
+        ? "bg-yellow-500/20 border-yellow-500/40 text-yellow-300"
+        : "bg-gray-500/20 border-gray-500/40 text-gray-300";
+
+  const bannerTone =
+    retakeAdvice.urgency === "required"
+      ? "bg-red-500/10 border-red-500/30 text-red-300"
+      : retakeAdvice.urgency === "suggested"
+        ? "bg-yellow-500/10 border-yellow-500/30 text-yellow-300"
+        : "bg-green-500/10 border-green-500/30 text-green-300";
+  const bannerLabel =
+    retakeAdvice.urgency === "required"
+      ? "再撮影を推奨します"
+      : retakeAdvice.urgency === "suggested"
+        ? "参考分析として採点しました"
+        : "撮影品質は良好です";
+
+  return (
+    <div className="space-y-4">
+      {/* [1] Headline — current state */}
+      <div className="rounded-xl p-5 border bg-gradient-to-br from-purple-500/10 to-pink-500/5 border-purple-500/30">
+        <h3 className="text-sm font-medium text-purple-300 mb-2">現状</h3>
+        <p className="text-sm text-gray-200 leading-relaxed mb-3">
+          {currentStateSummary.headline}
+        </p>
+        <div className="flex items-baseline gap-2 mb-2">
+          <span className="text-xs text-gray-500">{main.label}</span>
+          <span className={`text-4xl font-bold font-mono ${angleColor}`}>
+            {main.value}
+          </span>
+          <span className="text-xl text-gray-400">{main.unit}</span>
+          <span className="text-xs text-gray-500 ml-1">
+            / {main.target}
+            {main.unit}
+          </span>
+          <span className="ml-auto text-sm text-gray-400 font-mono">
+            スコア {currentStateSummary.score}
+          </span>
+        </div>
+        <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden mb-3">
+          <div
+            className={`h-full rounded-full transition-all duration-700 ${barColor}`}
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+        {currentStateSummary.positiveNotes.length > 0 && (
+          <ul className="text-xs text-green-300/80 space-y-0.5">
+            {currentStateSummary.positiveNotes.map((n, i) => (
+              <li key={i}>・{n}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* [2] Primary limiters */}
+      {primaryLimiters.length > 0 && (
+        <div className="rounded-xl p-5 border bg-gray-800/50 border-gray-700">
+          <h3 className="text-sm font-medium text-gray-300 mb-3">主な課題</h3>
+          <ol className="space-y-3">
+            {primaryLimiters.map((lim, i) => (
+              <li key={lim.id} className="flex gap-3">
+                <span className="flex-shrink-0 w-6 h-6 rounded-full bg-gray-700 text-gray-300 text-xs flex items-center justify-center font-mono">
+                  {i + 1}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`text-sm font-medium ${sevColor(lim.severity)}`}>
+                      {lim.label}
+                    </span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border ${sevBadge(lim.severity)}`}>
+                      {lim.severity}
+                    </span>
+                    {lim.estimatedImpact > 0 && (
+                      <span className="text-[10px] text-red-400/70 font-mono ml-auto">
+                        -{lim.estimatedImpact.toFixed(1)}pt
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1 leading-relaxed">
+                    {lim.finding}
+                  </p>
+                  <p className="text-[10px] text-gray-500 mt-1 font-mono">
+                    {lim.evidence.metric}: 実測 {lim.evidence.value}
+                    {lim.evidence.unit}
+                    {lim.evidence.threshold && (
+                      <>
+                        {" / 閾値 warn="}
+                        {lim.evidence.threshold.warn}
+                        {" fail="}
+                        {lim.evidence.threshold.fail}
+                      </>
+                    )}
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* [3] Improvement priorities */}
+      {improvementPriorities.length > 0 && (
+        <div className="rounded-xl p-5 border bg-gray-800/50 border-gray-700">
+          <h3 className="text-sm font-medium text-gray-300 mb-3">今日のポイント練習</h3>
+          <ul className="space-y-3">
+            {improvementPriorities.map((p, i) => (
+              <li key={i} className="border-l-2 border-purple-500/40 pl-3">
+                <p className="text-sm text-purple-300 font-medium">{p.focus}</p>
+                <p className="text-xs text-gray-300 mt-1 leading-relaxed">{p.practice}</p>
+                <p className="text-[10px] text-gray-500 mt-1">{p.durationHint}</p>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-[10px] text-gray-500 border-t border-gray-700/50 pt-2">
+            痛みを感じたら必ず中止してください。
+          </p>
+        </div>
+      )}
+
+      {/* [4] Reliability + retake banner */}
+      <div className={`rounded-xl p-4 border ${bannerTone}`}>
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-sm font-medium">{bannerLabel}</span>
+          <span className="ml-auto text-xs font-mono">
+            信頼度 {(reliabilitySummary.overall * 100).toFixed(0)}%
+          </span>
+        </div>
+        <div className="w-full h-1.5 bg-black/30 rounded-full overflow-hidden mb-2">
+          <div
+            className={`h-full rounded-full ${
+              reliabilitySummary.overall >= 0.75
+                ? "bg-green-400"
+                : reliabilitySummary.overall >= 0.5
+                  ? "bg-yellow-400"
+                  : "bg-red-400"
+            }`}
+            style={{ width: `${Math.round(reliabilitySummary.overall * 100)}%` }}
+          />
+        </div>
+        {reliabilitySummary.factors.length > 0 && (
+          <div className="flex gap-3 text-[10px] opacity-80 mb-2">
+            {reliabilitySummary.factors.map((f) => (
+              <span key={f.name}>
+                {f.name} {Math.round(f.score * 100)}%
+              </span>
+            ))}
+          </div>
+        )}
+        {retakeAdvice.reasons.length > 0 && (
+          <ul className="space-y-1.5 mt-2 border-t border-white/10 pt-2">
+            {retakeAdvice.reasons.map((r) => (
+              <li key={r.code} className="text-xs">
+                <p className="font-medium">・{r.message}</p>
+                <p className="opacity-80 ml-3 mt-0.5 leading-relaxed">{r.howToFix}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-2 pt-2 border-t border-white/10 text-[10px] opacity-60 font-mono">
+          分析エンジン: {summary.meta.evaluatorVersion}
+          <span className="mx-1">·</span>
+          生成: {new Date(summary.meta.generatedAt).toLocaleString("ja-JP")}
+        </p>
       </div>
     </div>
   );

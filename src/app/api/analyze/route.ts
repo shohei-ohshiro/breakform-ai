@@ -2,7 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { checkUsageLimit, incrementUsage } from "@/lib/usage";
 import { runPipeline } from "@/lib/analysis/pipeline";
-import { PipelineInput, TechniqueId, PoseFrame, SamplingInfo } from "@/lib/analysis/types";
+import {
+  PipelineInput,
+  TechniqueId,
+  PoseFrame,
+  SamplingInfo,
+  ErrorCode,
+  ApiErrorResponse,
+} from "@/lib/analysis/types";
+import { recordAnalysisMetric } from "@/lib/analysis/metrics";
 import { Landmark } from "@/lib/types";
 
 interface AnalyzeRequestV2 {
@@ -17,24 +25,60 @@ interface AnalyzeRequestV2 {
   sampling?: SamplingInfo;
 }
 
+function apiError(
+  errorCode: ErrorCode,
+  error: string,
+  status: number,
+  detail?: Record<string, unknown>,
+): NextResponse<ApiErrorResponse> {
+  return NextResponse.json<ApiErrorResponse>(
+    detail ? { error, errorCode, detail } : { error, errorCode },
+    { status },
+  );
+}
+
 export async function POST(request: NextRequest) {
+  const requestStartMs = Date.now();
+  let metricTechnique: TechniqueId | null = null;
+
+  const errorWithMetric = (
+    errorCode: ErrorCode,
+    error: string,
+    status: number,
+    detail?: Record<string, unknown>,
+  ): NextResponse<ApiErrorResponse> => {
+    recordAnalysisMetric({
+      technique: metricTechnique,
+      outcome: "error",
+      durationMs: Date.now() - requestStartMs,
+      errorCode,
+      appVersion: process.env.NEXT_PUBLIC_APP_VERSION,
+      buildId: process.env.NEXT_PUBLIC_BUILD_ID,
+    });
+    return apiError(errorCode, error, status, detail);
+  };
+
   try {
     const body: AnalyzeRequestV2 = await request.json();
     const { technique, trickId, trickNameJa, frames, sourceType, fps, duration, userLevel, sampling } = body;
+    metricTechnique = technique ?? null;
 
     if (!technique || !frames || frames.length === 0) {
-      return NextResponse.json(
-        { error: "Missing required fields" },
-        { status: 400 }
+      return errorWithMetric(
+        "missing_fields",
+        "必須フィールドが不足しています (technique または frames)",
+        400,
       );
     }
 
     // Validate technique
-    const validTechniques: TechniqueId[] = ["handstand", "planche", "swipes"];
+    const validTechniques: TechniqueId[] = ["handstand", "planche", "swipes", "middle_split"];
     if (!validTechniques.includes(technique)) {
-      return NextResponse.json(
-        { error: `対応していない技です: ${technique}` },
-        { status: 400 }
+      return errorWithMetric(
+        "unsupported_technique",
+        `対応していない技です: ${technique}`,
+        400,
+        { technique, supported: validTechniques },
       );
     }
 
@@ -70,14 +114,15 @@ export async function POST(request: NextRequest) {
         // Check usage limit
         const usage = await checkUsageLimit(supabase, user.id);
         if (!usage.allowed) {
-          return NextResponse.json(
+          return errorWithMetric(
+            "usage_limit_exceeded",
+            `今月の無料分析回数（${usage.limit}回）を使い切りました。有料プランにアップグレードするか、来月までお待ちください。`,
+            429,
             {
-              error: `今月の無料分析回数（${usage.limit}回）を使い切りました。有料プランにアップグレードするか、来月までお待ちください。`,
               usageExceeded: true,
               remaining: usage.remaining,
               limit: usage.limit,
             },
-            { status: 429 }
           );
         }
 
@@ -94,9 +139,10 @@ export async function POST(request: NextRequest) {
     // --- Run Analysis Pipeline ---
     const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
     if (!anthropicApiKey) {
-      return NextResponse.json(
-        { error: "API key not configured" },
-        { status: 500 }
+      return errorWithMetric(
+        "api_key_missing",
+        "分析APIキーが設定されていません。管理者にお問い合わせください。",
+        500,
       );
     }
 
@@ -111,6 +157,19 @@ export async function POST(request: NextRequest) {
     };
 
     const result = await runPipeline(pipelineInput, anthropicApiKey);
+
+    recordAnalysisMetric({
+      technique: metricTechnique,
+      outcome: "success",
+      durationMs: Date.now() - requestStartMs,
+      finalScore: result.finalScore,
+      qualityLevel: result.qualityLevel,
+      reliability: result.reliability,
+      viewpoint: result.viewpoint,
+      evaluatorConfigVersion: result.ruleResultJson.meta.configVersion,
+      appVersion: process.env.NEXT_PUBLIC_APP_VERSION,
+      buildId: process.env.NEXT_PUBLIC_BUILD_ID,
+    });
 
     // --- Save result & increment usage ---
     if (userId && supabaseUrl && supabaseAnonKey) {
@@ -145,6 +204,14 @@ export async function POST(request: NextRequest) {
         viewpoint: result.viewpoint,
         quality_check_result: result.qualityCheck,
         final_score: result.finalScore,
+        // Sprint 3 production fields (migration 003)
+        reliability: result.reliability,
+        quality_level: result.qualityLevel,
+        retake_reasons: result.retakeReasons,
+        structured_summary: result.structuredSummary ?? null,
+        evaluator_config_version: result.ruleResultJson.meta.configVersion,
+        app_version: process.env.NEXT_PUBLIC_APP_VERSION ?? null,
+        build_id: process.env.NEXT_PUBLIC_BUILD_ID ?? null,
       });
 
       await incrementUsage(supabase, userId);
@@ -186,6 +253,10 @@ export async function POST(request: NextRequest) {
       breakdown: result.ruleResultJson.breakdown,
       qualityLevel: result.qualityLevel,
       qualityExplanation: result.qualityExplanation,
+      reliability: result.reliability,
+      retakeRecommended: result.retakeRecommended,
+      retakeReasons: result.retakeReasons,
+      structuredSummary: result.structuredSummary,
       buildInfo,
       meta: {
         evaluationMode: result.ruleResultJson.meta.evaluationMode,
@@ -217,9 +288,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(responseBody);
   } catch (error) {
     console.error("Analysis error:", error);
-    return NextResponse.json(
-      { error: "分析に失敗しました。もう一度お試しください。" },
-      { status: 500 }
+    return errorWithMetric(
+      "pipeline_error",
+      "分析に失敗しました。もう一度お試しください。",
+      500,
+      { message: error instanceof Error ? error.message : String(error) },
     );
   }
 }

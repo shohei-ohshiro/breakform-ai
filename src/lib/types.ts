@@ -60,6 +60,7 @@ export interface Trick {
   difficulty: number;
   description: string;
   description_ja: string;
+  captureGuidance_ja?: string;
 }
 
 export type TrickCategory =

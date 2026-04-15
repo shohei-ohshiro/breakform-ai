@@ -6,11 +6,15 @@ import {
   GeneratedAdvice,
   TechniqueId,
 } from "./types";
+import { sanitizeMiddleSplitText } from "./copy/middleSplit";
+
+export { sanitizeMiddleSplitText };
 
 const TECHNIQUE_NAMES: Record<TechniqueId, string> = {
   handstand: "倒立（ハンドスタンド）",
   planche: "プランシェ",
   swipes: "スワイプス",
+  middle_split: "横開脚（180度開脚）",
 };
 
 /**
@@ -82,6 +86,18 @@ ${evaluation.meta.confidenceNote ? `備考: ${evaluation.meta.confidenceNote}` :
 - 「まだ保持ではないが、進入フォームとしてはここまでできている」という段階的な表現を使う`
     : "";
 
+  const middleSplitToneGuidance = evaluation.technique === "middle_split"
+    ? `
+## 横開脚フィードバックのトーン指示（必ず守ってください）
+- 柔軟性や関節の状態を「診断」しないこと。骨格推定から見える姿勢・角度・代償の proxy として説明する
+- 医療/解剖用語（筋肉名、関節病名、「拘縮」「機能障害」など）は使わない
+- 「〜の傾向があります」「〜の可能性があります」「〜のように見えます」を基本語尾にする
+- アドバイスは「ストレッチ」「可動域づくり」「フォーム意識」の 3 種類に限定
+- 断定は数値（角度、左右差）のみ
+- 最後に「痛みを感じたら中止してください」を必ず 1 回含める
+- ボトルネックは「骨盤後傾 / 股関節外転不足 / 膝曲げ代償 / 左右差 / 体幹倒れ込み」のいずれか (or 複数) から選ぶ`
+    : "";
+
   const prompt = `あなたはブレイクダンスの専門コーチです。
 以下のルールベース分析結果をもとに、ユーザーへの自然な日本語フィードバックを作成してください。
 
@@ -104,7 +120,7 @@ ${eventsSummary}
 
 ## 改善提案のドラフト
 - ${suggestionsDraft}
-${entryToneGuidance}
+${entryToneGuidance}${middleSplitToneGuidance}
 
 ## 回答フォーマット（JSONのみ返してください）
 {
@@ -152,11 +168,31 @@ ${entryToneGuidance}
   }
 
   try {
-    return JSON.parse(jsonStr) as GeneratedAdvice;
+    const parsed = JSON.parse(jsonStr) as GeneratedAdvice;
+    if (evaluation.technique === "middle_split") {
+      return sanitizeMiddleSplitAdvice(parsed);
+    }
+    return parsed;
   } catch {
     // Fallback: construct from rule results
     return buildFallbackAdvice(evaluation);
   }
+}
+
+/** Apply the middle_split language guardrails to a generated advice payload. */
+function sanitizeMiddleSplitAdvice(advice: GeneratedAdvice): GeneratedAdvice {
+  return {
+    issues: advice.issues.map((i) => ({
+      ...i,
+      description: sanitizeMiddleSplitText(i.description),
+      body_part: sanitizeMiddleSplitText(i.body_part),
+    })),
+    advice: advice.advice.map((a) => ({
+      ...a,
+      content: sanitizeMiddleSplitText(a.content),
+    })),
+    summary: sanitizeMiddleSplitText(advice.summary),
+  };
 }
 
 /**
@@ -187,7 +223,14 @@ export function buildFallbackAdvice(
 
   const techniqueName = TECHNIQUE_NAMES[evaluation.technique];
   let summary: string;
-  if (isEntry) {
+  if (evaluation.technique === "middle_split") {
+    summary =
+      evaluation.finalScore >= 85
+        ? `横開脚はかなり仕上がっています。細部のバランスを整えれば 180° が見えてきます。痛みを感じたら中止してください。`
+        : evaluation.finalScore >= 60
+          ? `横開脚の土台はできてきています。骨盤の向きや脚の伸びを意識するとさらに深くなる可能性があります。痛みを感じたら中止してください。`
+          : `まずは骨盤を立てて膝を伸ばした状態を優先しましょう。無理のない範囲で続けることが一番の近道です。痛みを感じたら中止してください。`;
+  } else if (isEntry) {
     summary =
       evaluation.finalScore >= 70
         ? `${techniqueName}の進入フォームは良い段階です。保持に向けてさらに精度を上げましょう。`
@@ -203,7 +246,11 @@ export function buildFallbackAdvice(
           : `${techniqueName}の基礎固めが必要です。一つずつ改善していきましょう。`;
   }
 
-  return { issues, advice, summary };
+  const fallback = { issues, advice, summary };
+  if (evaluation.technique === "middle_split") {
+    return sanitizeMiddleSplitAdvice(fallback);
+  }
+  return fallback;
 }
 
 /**

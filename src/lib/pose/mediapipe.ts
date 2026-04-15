@@ -77,19 +77,39 @@ function toLandmarks(
 }
 
 /**
- * Detect pose from an image element
+ * Detect pose from a still image source (HTMLImageElement or HTMLCanvasElement).
+ * Canvas support lets callers pass a snapshot of a video frame without
+ * going through a data-URL round-trip.
  */
 export async function detectPoseFromImage(
-  imageElement: HTMLImageElement
+  imageSource: HTMLImageElement | HTMLCanvasElement,
 ): Promise<Landmark[] | null> {
   const landmarker = await initImageLandmarker();
-  const result = landmarker.detect(imageElement);
+  const result = landmarker.detect(imageSource);
 
   if (!result.landmarks || result.landmarks.length === 0) {
     return null;
   }
 
   return toLandmarks(result.landmarks[0]);
+}
+
+/**
+ * Capture the currently displayed frame of a video element to an
+ * offscreen canvas. Used by the pre-capture quality check so we can
+ * run a single-frame pose detection without modifying the video state.
+ */
+export function captureVideoFrameToCanvas(
+  video: HTMLVideoElement,
+): HTMLCanvasElement | null {
+  if (video.videoWidth === 0 || video.videoHeight === 0) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 
 // ============================================

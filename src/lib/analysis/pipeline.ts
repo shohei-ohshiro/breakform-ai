@@ -34,6 +34,8 @@ import {
   QualityImpact,
   SamplingInfo,
   EvaluationResult,
+  FeatureSet,
+  RetakeReason,
   featureSetToJSON,
   FeatureSetJSON,
 } from "./types";
@@ -42,6 +44,7 @@ import { checkQuality } from "./quality-checker";
 import { extractFeatures } from "./feature-extractor";
 import { evaluate } from "./evaluators";
 import { generateAdvice, buildFallbackAdvice } from "./advice-generator";
+import { buildMiddleSplitSummary } from "./summary/middleSplit";
 
 export async function runPipeline(
   input: PipelineInput,
@@ -65,7 +68,7 @@ export async function runPipeline(
 
   // If quality is too low AND not even reference-analyzable, return early
   if (!qualityCheck.passed && !qualityCheck.analyzableAsReference) {
-    const qLevel = computeQualityLevel(qualityCheck);
+    const earlyReasons = buildRetakeReasons(qualityCheck, undefined, 0, input.technique);
     return {
       score: 0,
       issues: [
@@ -79,9 +82,8 @@ export async function runPipeline(
         {
           type: "training",
           related_issue: 1,
-          content: qualityCheck.retryRecommended
-            ? "人物がはっきり映るように撮影し直してください。全身が画面内に収まり、十分な明るさがあることを確認してください。"
-            : "分析精度が低い可能性があります。",
+          content:
+            "人物がはっきり映るように撮影し直してください。全身が画面内に収まり、十分な明るさがあることを確認してください。",
         },
       ],
       summary: "分析に十分な品質のデータが得られませんでした。",
@@ -104,8 +106,12 @@ export async function runPipeline(
       },
       viewpoint,
       finalScore: 0,
-      qualityLevel: qLevel,
-      qualityExplanation: computeQualityExplanation(qualityCheck, qLevel),
+      qualityLevel: "retry",
+      qualityExplanation:
+        "分析に十分な品質のデータが得られませんでした。再撮影をおすすめします。",
+      reliability: 0,
+      retakeRecommended: true,
+      retakeReasons: earlyReasons,
     };
   }
 
@@ -113,7 +119,7 @@ export async function runPipeline(
   const normalized = normalizePoseTimeSeries(timeSeries);
 
   // 4. Extract features
-  const features = extractFeatures(normalized);
+  const features = extractFeatures(normalized, input.technique);
 
   // 5. Evaluate (pass sampling so evaluators can include coverage info)
   const evaluation = evaluate(input.technique, normalized, features, input.sampling);
@@ -141,7 +147,31 @@ export async function runPipeline(
     generatedAdvice = buildFallbackAdvice(evaluation);
   }
 
-  const qualityLevel = computeQualityLevel(qualityCheck);
+  const reliability = evaluation.meta.qualityImpactSummary?.reliability ?? 1;
+  const qualityLevel = computeQualityLevel(
+    qualityCheck,
+    reliability,
+    features,
+    input.technique,
+  );
+  const retakeReasons = buildRetakeReasons(
+    qualityCheck,
+    features,
+    reliability,
+    input.technique,
+  );
+  const retakeRecommended = qualityLevel !== "good" || retakeReasons.length > 0;
+
+  const structuredSummary =
+    input.technique === "middle_split"
+      ? buildMiddleSplitSummary({
+          evaluation,
+          features,
+          reliability,
+          qualityLevel,
+          retakeReasons,
+        })
+      : undefined;
 
   return {
     score: evaluation.finalScore,
@@ -156,20 +186,122 @@ export async function runPipeline(
     finalScore: evaluation.finalScore,
     qualityLevel,
     qualityExplanation: computeQualityExplanation(qualityCheck, qualityLevel),
+    reliability,
+    retakeRecommended,
+    retakeReasons,
+    structuredSummary,
   };
 }
 
 /**
- * Compute a 3-level quality classification for UI display.
- * - "good": quality passed, few warnings
- * - "reference": borderline quality, results should be treated as reference
- * - "retry": quality too low, re-record recommended
+ * Compute a 3-level quality classification for UI display based on reliability.
+ *
+ * Thresholds (approved in the UX design review):
+ * - reliability ≥ 0.75              → good
+ * - 0.50 ≤ reliability < 0.75       → reference
+ * - reliability < 0.50              → retry
+ * - Additional middle_split gate:
+ *   frontalityScore < 0.5 forces "retry" even if reliability is otherwise OK,
+ *   because measurements become too unreliable without a frontal view.
  */
-function computeQualityLevel(quality: QualityCheckResult): QualityLevel {
-  if (quality.passed && quality.warnings.length <= 1) return "good";
-  if (quality.passed) return "good"; // passed but with warnings is still "good"
-  if (quality.analyzableAsReference) return "reference";
+function computeQualityLevel(
+  quality: QualityCheckResult,
+  reliability: number,
+  features?: FeatureSet,
+  technique?: PipelineInput["technique"],
+): QualityLevel {
+  if (!quality.passed && !quality.analyzableAsReference) return "retry";
+
+  if (technique === "middle_split" && features?.middleSplit) {
+    if (features.middleSplit.frontalityScore < 0.5) return "retry";
+  }
+
+  if (reliability >= 0.75) return "good";
+  if (reliability >= 0.5) return "reference";
   return "retry";
+}
+
+/**
+ * Build a structured list of retake reasons for the result UI.
+ * Each reason has a stable `code` (for analytics), a user-facing `message`,
+ * and a concrete `howToFix` hint.
+ */
+function buildRetakeReasons(
+  quality: QualityCheckResult,
+  features: FeatureSet | undefined,
+  reliability: number,
+  technique: PipelineInput["technique"],
+): RetakeReason[] {
+  const reasons: RetakeReason[] = [];
+  const details = quality.details;
+
+  // middle_split-specific front-view gate
+  if (technique === "middle_split" && features?.middleSplit) {
+    const ms = features.middleSplit;
+    if (ms.frontalityScore < 0.7) {
+      reasons.push({
+        code: "low_frontality",
+        message: "正面から撮影されていない可能性があります",
+        howToFix:
+          "カメラを被写体のつま先側に置き、まっすぐ正面から撮影し直してください",
+      });
+    }
+    if (ms.keyLandmarkVisibility < 0.7) {
+      reasons.push({
+        code: "landmark_missing",
+        message: "骨盤〜足先の検出がやや不安定です",
+        howToFix:
+          "骨盤から足先まで全身が画面に収まるように少し引いて撮影し、タイトめの服装を選ぶと精度が上がります",
+      });
+    }
+  }
+
+  if (details.avgVisibility < 0.7) {
+    reasons.push({
+      code: "low_visibility",
+      message: `骨格検出精度が低めです（${(details.avgVisibility * 100).toFixed(0)}%）`,
+      howToFix:
+        "明るい場所で、体のラインが見える服装にして撮影し直すと検出精度が上がります",
+    });
+  }
+
+  if (details.outOfFrameRatio > 0.15) {
+    reasons.push({
+      code: "image_cropped",
+      message: "体の一部がフレーム外に出ている可能性があります",
+      howToFix: "カメラを少し引いて、全身が画面内に収まるようにしてください",
+    });
+  }
+
+  if (details.subjectSize > 0 && details.subjectSize < 0.1) {
+    reasons.push({
+      code: "subject_too_small",
+      message: "被写体がやや小さく映っています",
+      howToFix: "もう少し近くから、全身がちょうど収まる距離で撮影してください",
+    });
+  }
+
+  if (!details.sufficientFrames) {
+    reasons.push({
+      code: "insufficient_frames",
+      message: "分析に使えるフレームが不足しています",
+      howToFix: "もう少し長い動画、または別の角度で撮影し直してください",
+    });
+  }
+
+  if (
+    reliability < 0.5 &&
+    reasons.length === 0 // avoid duplicating when a specific reason already exists
+  ) {
+    reasons.push({
+      code: "low_reliability",
+      message: "今回の撮影は分析信頼度が低めでした",
+      howToFix:
+        "明るい場所で、全身がはっきり映るように撮影し直すとより正確に判定できます",
+    });
+  }
+
+  return reasons;
 }
 
 function computeQualityExplanation(quality: QualityCheckResult, level: QualityLevel): string {
