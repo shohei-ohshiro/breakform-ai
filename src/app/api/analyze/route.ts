@@ -257,6 +257,17 @@ export async function POST(request: NextRequest) {
       retakeRecommended: result.retakeRecommended,
       retakeReasons: result.retakeReasons,
       structuredSummary: result.structuredSummary,
+      // Compact middle_split feature payload — always exposed (not gated on
+      // debug) so the history compare UI can read it without a full featureJson.
+      middleSplitFeatures: result.featureJson.middleSplit
+        ? {
+            splitAngleRaw: result.featureJson.middleSplit.splitAngleRaw,
+            leftRightAngleDiff: result.featureJson.middleSplit.leftRightAngleDiff,
+            pelvisRollAngle: result.featureJson.middleSplit.pelvisRollAngle,
+            trunkLeanAngle: result.featureJson.middleSplit.trunkLeanAngle,
+            frontalityScore: result.featureJson.middleSplit.frontalityScore,
+          }
+        : undefined,
       buildInfo,
       meta: {
         evaluationMode: result.ruleResultJson.meta.evaluationMode,

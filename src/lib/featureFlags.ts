@@ -19,6 +19,7 @@
 export type FeatureFlag =
   | "middle_split_precapture_check"
   | "middle_split_structured_summary"
+  | "middle_split_ux_v1_1"
   | "analysis_metrics"
   | "history_local_storage";
 
@@ -43,6 +44,12 @@ const FLAG_SPECS: Record<FeatureFlag, FlagSpec> = {
     visibility: "client",
     description:
       "Render the structured summary panel on the middle_split result screen.",
+  },
+  middle_split_ux_v1_1: {
+    default: true,
+    visibility: "client",
+    description:
+      "Enable the UX polish v1.1 result layout (hero verdict, top priority, sticky retake CTA, debug meta panel).",
   },
   analysis_metrics: {
     default: true,

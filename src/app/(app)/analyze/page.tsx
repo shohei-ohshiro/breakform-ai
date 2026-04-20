@@ -9,6 +9,8 @@ import TrickSelector from "@/components/analysis/TrickSelector";
 import PoseCanvas from "@/components/analysis/PoseCanvas";
 import ScoreCard from "@/components/analysis/ScoreCard";
 import AdvicePanel from "@/components/analysis/AdvicePanel";
+import MiddleSplitResultView from "@/components/analysis/middleSplit/MiddleSplitResultView";
+import MiddleSplitOverlay from "@/components/analysis/middleSplit/MiddleSplitOverlay";
 import {
   Trick,
   Landmark,
@@ -19,6 +21,10 @@ import { detectPoseFromImage, extractPoseTimeSeries, TimestampMismatchError, cap
 import { TechniqueId, SamplingInfo, StructuredSummary, RetakeReason, ErrorCode } from "@/lib/analysis/types";
 import { runPreCaptureCheck, PreCaptureCheckResult } from "@/lib/analysis/preCaptureCheck";
 import { addHistoryEntry } from "@/lib/analysis/history";
+import {
+  buildMiddleSplitComparison,
+  type MiddleSplitComparison,
+} from "@/lib/analysis/history-compare";
 import { isFeatureEnabled } from "@/lib/featureFlags";
 
 const STATE_MESSAGES: Record<AnalysisState, string> = {
@@ -180,6 +186,14 @@ interface ExtendedResult extends AnalysisResult {
     buildTime: string;
     evaluatorConfigVersion: string;
   };
+  /** Compact middle_split feature payload — always returned for middle_split. */
+  middleSplitFeatures?: {
+    splitAngleRaw: number;
+    leftRightAngleDiff: number;
+    pelvisRollAngle: number;
+    trunkLeanAngle: number;
+    frontalityScore: number;
+  };
   // Debug-only fields (returned when ?debug=true)
   ruleResultJson?: Record<string, unknown>;
   featureJson?: Record<string, unknown>;
@@ -204,6 +218,7 @@ function AnalyzePage() {
   const [selectedTrick, setSelectedTrick] = useState<Trick | null>(null);
   const [landmarks, setLandmarks] = useState<Landmark[] | null>(null);
   const [result, setResult] = useState<ExtendedResult | null>(null);
+  const [comparison, setComparison] = useState<MiddleSplitComparison | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<ErrorCode | null>(null);
   const [preCheck, setPreCheck] = useState<PreCaptureCheckResult | null>(null);
@@ -296,6 +311,7 @@ function AnalyzePage() {
     setPreviewUrl(url);
     setLandmarks(null);
     setResult(null);
+    setComparison(null);
     setError(null);
     setErrorCode(null);
     setProgress("");
@@ -323,6 +339,7 @@ function AnalyzePage() {
     setError(null);
     setErrorCode(null);
     setResult(null);
+    setComparison(null);
 
     try {
       setState("detecting");
@@ -441,15 +458,53 @@ function AnalyzePage() {
       setState("complete");
 
       if (selectedTrick) {
-        addHistoryEntry({
+        const topLim = analysisResult.structuredSummary?.primaryLimiters[0];
+        const msFeature = analysisResult.middleSplitFeatures;
+
+        const historyComparable =
+          analysisResult.structuredSummary?.meta.historyComparable === true;
+        const middleSplitEntry =
+          historyComparable && msFeature && selectedTrick.id === "middle_split"
+            ? {
+                splitAngle: Math.round(msFeature.splitAngleRaw * 10) / 10,
+                leftRightAngleDiff:
+                  Math.round(msFeature.leftRightAngleDiff * 10) / 10,
+                pelvisRollAngle:
+                  Math.round(msFeature.pelvisRollAngle * 10) / 10,
+                trunkLeanAngle:
+                  Math.round(msFeature.trunkLeanAngle * 10) / 10,
+                primaryLimiterId: topLim?.id,
+                primaryLimiterLabel: topLim?.label,
+              }
+            : undefined;
+
+        const nextHistory = addHistoryEntry({
           technique: selectedTrick.id as TechniqueId,
           trickNameJa: selectedTrick.name_ja,
           score: analysisResult.score ?? 0,
           qualityLevel: analysisResult.qualityLevel ?? "reference",
           reliability: analysisResult.reliability ?? 0,
           headline: analysisResult.structuredSummary?.currentStateSummary.headline,
-          topLimiter: analysisResult.structuredSummary?.primaryLimiters[0]?.label,
+          topLimiter: topLim?.label,
+          middleSplit: middleSplitEntry,
+          frontalityScore: msFeature?.frontalityScore,
         });
+
+        // Build previous-run comparison. `nextHistory` is newest-first with the
+        // just-saved entry at [0] — the prior middle_split run is the first
+        // subsequent entry that has comparable fields.
+        if (
+          selectedTrick.id === "middle_split" &&
+          isFeatureEnabled("history_local_storage") &&
+          nextHistory.length >= 2
+        ) {
+          const latestEntry = nextHistory[0];
+          const previousEntry = nextHistory
+            .slice(1)
+            .find((e) => e.technique === "middle_split" && e.middleSplit);
+          const cmp = buildMiddleSplitComparison(latestEntry, previousEntry);
+          setComparison(cmp);
+        }
       }
 
       // Refresh usage
@@ -634,6 +689,23 @@ function AnalyzePage() {
                 />
               </div>
             )}
+
+            {/* Middle Split Overlay — analysis result on image */}
+            {landmarks &&
+              previewUrl &&
+              selectedTrick?.id === "middle_split" &&
+              result?.middleSplitFeatures && (
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-2">
+                    分析オーバーレイ
+                  </h3>
+                  <MiddleSplitOverlay
+                    imageUrl={previewUrl}
+                    landmarks={landmarks}
+                    features={result.middleSplitFeatures}
+                  />
+                </div>
+              )}
 
             {/* Quality Warnings + Reference Analysis Notice */}
             {result?.qualityCheck && result.qualityCheck.warnings.length > 0 && (
@@ -955,7 +1027,15 @@ function AnalyzePage() {
             {selectedTrick?.id === "middle_split" &&
               result?.structuredSummary &&
               isFeatureEnabled("middle_split_structured_summary") && (
-                <MiddleSplitSummaryPanel summary={result.structuredSummary} />
+                isFeatureEnabled("middle_split_ux_v1_1") ? (
+                  <MiddleSplitResultView
+                    summary={result.structuredSummary}
+                    comparison={comparison}
+                    isDebug={isDebugMode}
+                  />
+                ) : (
+                  <MiddleSplitSummaryPanel summary={result.structuredSummary} />
+                )
               )}
 
             {/* Score Breakdown */}

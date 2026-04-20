@@ -621,6 +621,19 @@ export interface GeneratedAdvice {
 export type QualityLevel = "good" | "reference" | "retry";
 
 /**
+ * Input classification for middle_split.
+ *
+ * - `analyzable`:正面・全身・静止 — 通常採点で問題ない。
+ * - `reference`: 軽い斜めや被写体サイズの劣化など、指標の傾向は読めるが数値は参考値。
+ * - `discouraged`: 強い斜めや足先切れなど、ユーザーに撮り直しを強く勧める状態。
+ * - `blocked`: 分析そのものが成立しない（手前の pipeline で止める）。
+ *
+ * This classification is the single source of truth that the result UI uses to
+ * decide layout priority (e.g. show reliability above score, blur the score, etc.).
+ */
+export type InputClass = "analyzable" | "reference" | "discouraged" | "blocked";
+
+/**
  * Versioned, structured result summary that UI / history / Claude API all read.
  * This is the canonical form; free-text `summary` is derived from it.
  */
@@ -683,7 +696,21 @@ export interface StructuredSummary {
     technique: TechniqueId;
     evaluatorVersion: string;
     configVersion: string;
+    /** Summary schema version — bump when the StructuredSummary shape changes. */
+    summaryVersion: string;
+    /** Capture-guidance / preCaptureCheck rules version for debug provenance. */
+    captureGuidanceVersion: string;
     generatedAt: string;
+    /** Reliability duplicated here so Debug/History can read a single object. */
+    reliability: number;
+    /** Quality level duplicated for the same reason. */
+    qualityLevel: QualityLevel;
+    /** Whether UI should nudge for retake — mirrors PipelineResult.retakeRecommended. */
+    retakeRecommended: boolean;
+    /** Classification used by the result UI to decide layout priority. */
+    inputClass: InputClass;
+    /** True when this result contains enough fields for history comparison. */
+    historyComparable: boolean;
   };
 }
 

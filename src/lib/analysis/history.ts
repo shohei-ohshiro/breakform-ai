@@ -30,6 +30,21 @@ export interface HistoryEntry {
   headline?: string;
   /** Optional one-line take-away so the list can show something useful. */
   topLimiter?: string;
+  /**
+   * Middle-split-specific comparison metrics. Present only for middle_split
+   * entries that are `historyComparable`. Kept optional so older entries still
+   * deserialize cleanly and non-middle_split entries stay compact.
+   */
+  middleSplit?: {
+    splitAngle: number;
+    leftRightAngleDiff: number;
+    pelvisRollAngle: number;
+    trunkLeanAngle: number;
+    primaryLimiterId?: string;
+    primaryLimiterLabel?: string;
+  };
+  /** Auxiliary signal for deciding whether two entries are comparable. */
+  frontalityScore?: number;
 }
 
 function isBrowser(): boolean {

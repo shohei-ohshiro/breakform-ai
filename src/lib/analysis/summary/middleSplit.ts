@@ -8,12 +8,14 @@
 import {
   EvaluationResult,
   FeatureSet,
+  InputClass,
   QualityLevel,
   RetakeReason,
   StructuredSummary,
   RuleViolation,
 } from "../types";
 import { MIDDLE_SPLIT_ADVICE } from "../copy/middleSplit";
+import { CAPTURE_GUIDANCE_VERSION } from "../input-policy";
 
 const EVALUATOR_VERSION = "middle_split_1.0";
 const SUMMARY_VERSION = "middle_split_summary_v1";
@@ -24,23 +26,53 @@ interface BuildSummaryInput {
   reliability: number;
   qualityLevel: QualityLevel;
   retakeReasons: RetakeReason[];
+  retakeRecommended?: boolean;
+  inputClass?: InputClass;
 }
 
 export function buildMiddleSplitSummary(
   input: BuildSummaryInput,
 ): StructuredSummary {
-  const { evaluation, features, reliability, qualityLevel, retakeReasons } =
-    input;
+  const {
+    evaluation,
+    features,
+    reliability,
+    qualityLevel,
+    retakeReasons,
+    retakeRecommended,
+    inputClass = "analyzable",
+  } = input;
   const f = features.middleSplit;
 
   const splitAngle = f?.splitAngleRaw ?? 0;
   const target = 180;
   const progressRatio = Math.max(0, Math.min(1, splitAngle / target));
 
-  const headline =
-    splitAngle > 0
-      ? `開脚角度は約${Math.round(splitAngle)}°。180°まで残り${Math.max(0, Math.round(target - splitAngle))}°の目安です。`
-      : "十分な計測ができませんでした。";
+  // Compute primaryLimiters up front so the headline can reference the top one.
+  const rankedEarly = [...evaluation.violations]
+    .filter((v) => (v.scoreImpact ?? 0) > 0)
+    .sort((a, b) => (b.scoreImpact ?? 0) - (a.scoreImpact ?? 0));
+  const topLimiterEarly = rankedEarly[0];
+  const topLimiterLabel = topLimiterEarly ? limiterLabel(topLimiterEarly) : "";
+
+  // Conclusion-first headline.
+  // - retry  : "計測に失敗しました。撮り直しが必要です。"
+  // - reference: "参考値: 約◯°。まずは再撮影で精度を上げてください。"
+  // - good (with limiter): "あと◯°で180°。主要課題は {label} です。"
+  // - good (no limiter)  : "あと◯°で180°。大きな改善点は見つかりませんでした。"
+  // - no measurement     : "十分な計測ができませんでした。"
+  let headline: string;
+  if (qualityLevel === "retry") {
+    headline = "計測に失敗しました。撮り直しが必要です。";
+  } else if (splitAngle <= 0) {
+    headline = "十分な計測ができませんでした。";
+  } else if (qualityLevel === "reference") {
+    headline = `参考値: 約${Math.round(splitAngle)}°。まずは再撮影で精度を上げてください。`;
+  } else if (topLimiterLabel) {
+    headline = `あと${Math.max(0, Math.round(target - splitAngle))}°で180°。主要課題は「${topLimiterLabel}」です。`;
+  } else {
+    headline = `あと${Math.max(0, Math.round(target - splitAngle))}°で180°。大きな改善点は見つかりませんでした。`;
+  }
 
   // Positive notes — call out what's going well before surfacing limiters.
   const positiveNotes: string[] = [];
@@ -60,9 +92,7 @@ export function buildMiddleSplitSummary(
   }
 
   // Rank violations by score impact, take top 3 as primary limiters.
-  const ranked = [...evaluation.violations]
-    .filter((v) => (v.scoreImpact ?? 0) > 0)
-    .sort((a, b) => (b.scoreImpact ?? 0) - (a.scoreImpact ?? 0));
+  const ranked = rankedEarly;
 
   const primaryLimiters = ranked.slice(0, 3).map((v) => ({
     id: v.ruleId,
@@ -149,7 +179,15 @@ export function buildMiddleSplitSummary(
       technique: "middle_split",
       evaluatorVersion: EVALUATOR_VERSION,
       configVersion: EVALUATOR_VERSION,
+      summaryVersion: SUMMARY_VERSION,
+      captureGuidanceVersion: CAPTURE_GUIDANCE_VERSION,
       generatedAt: new Date().toISOString(),
+      reliability: round2(reliability),
+      qualityLevel,
+      retakeRecommended:
+        retakeRecommended ?? (retakeReasons.length > 0 || qualityLevel !== "good"),
+      inputClass,
+      historyComparable: splitAngle > 0 && qualityLevel !== "retry",
     },
   };
 }

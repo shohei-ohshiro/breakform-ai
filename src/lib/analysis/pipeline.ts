@@ -32,10 +32,10 @@ import {
   QualityLevel,
   QualityImpactSummary,
   QualityImpact,
-  SamplingInfo,
   EvaluationResult,
   FeatureSet,
   RetakeReason,
+  InputClass,
   featureSetToJSON,
   FeatureSetJSON,
 } from "./types";
@@ -45,6 +45,7 @@ import { extractFeatures } from "./feature-extractor";
 import { evaluate } from "./evaluators";
 import { generateAdvice, buildFallbackAdvice } from "./advice-generator";
 import { buildMiddleSplitSummary } from "./summary/middleSplit";
+import { classifyInput } from "./input-policy";
 
 export async function runPipeline(
   input: PipelineInput,
@@ -68,7 +69,15 @@ export async function runPipeline(
 
   // If quality is too low AND not even reference-analyzable, return early
   if (!qualityCheck.passed && !qualityCheck.analyzableAsReference) {
-    const earlyReasons = buildRetakeReasons(qualityCheck, undefined, 0, input.technique);
+    const earlyClass = classifyInput({
+      technique: input.technique,
+      features: undefined,
+      quality: qualityCheck,
+      reliability: 0,
+    });
+    const earlyReasons = earlyClass.reasons.length > 0
+      ? earlyClass.reasons
+      : buildRetakeReasons(qualityCheck, undefined, 0, input.technique);
     return {
       score: 0,
       issues: [
@@ -154,13 +163,26 @@ export async function runPipeline(
     features,
     input.technique,
   );
-  const retakeReasons = buildRetakeReasons(
-    qualityCheck,
+
+  // New: input classification drives result-screen layout & retake copy.
+  const inputClassification = classifyInput({
+    technique: input.technique,
     features,
+    quality: qualityCheck,
     reliability,
-    input.technique,
-  );
-  const retakeRecommended = qualityLevel !== "good" || retakeReasons.length > 0;
+  });
+  const inputClass: InputClass = inputClassification.class;
+
+  // Prefer the policy's retake copy (action-first) when available.
+  // Fall back to the older buildRetakeReasons list for non-middle_split techniques.
+  const retakeReasons =
+    input.technique === "middle_split"
+      ? inputClassification.reasons
+      : buildRetakeReasons(qualityCheck, features, reliability, input.technique);
+  const retakeRecommended =
+    qualityLevel !== "good" ||
+    retakeReasons.length > 0 ||
+    inputClass === "discouraged";
 
   const structuredSummary =
     input.technique === "middle_split"
@@ -170,6 +192,8 @@ export async function runPipeline(
           reliability,
           qualityLevel,
           retakeReasons,
+          retakeRecommended,
+          inputClass,
         })
       : undefined;
 
