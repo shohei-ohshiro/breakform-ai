@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 700" width="600" height="700">
+  <rect width="600" height="700" fill="#0f172a"/>
+
+  <!-- Floor -->
+  <line x1="20" y1="559" x2="580" y2="559" stroke="#334155" stroke-width="1" stroke-dasharray="8 4"/>
+
+  <!-- Skeleton -->
+  <line x1="276.0" y1="231.0" x2="324.0" y2="231.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="276.0" y1="231.0" x2="276.0" y2="385.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="324.0" y1="231.0" x2="324.0" y2="385.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="276.0" y1="385.0" x2="324.0" y2="385.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="276.0" y1="231.0" x2="252.0" y2="315.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="252.0" y1="315.0" x2="240.0" y2="385.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="324.0" y1="231.0" x2="348.0" y2="315.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="348.0" y1="315.0" x2="360.0" y2="385.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="276.0" y1="385.0" x2="192.4" y2="453.3" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="192.4" y1="453.3" x2="134.6" y2="533.7" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="324.0" y1="385.0" x2="407.6" y2="453.3" stroke="#4ade80" stroke-width="3" stroke-linecap="round"/>
+  <line x1="407.6" y1="453.3" x2="459.2" y2="539.3" stroke="#4ade80" stroke-width="3" stroke-linecap="round"/>
+  <line x1="134.6" y1="533.7" x2="122.6" y2="533.7" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="459.2" y1="539.3" x2="471.2" y2="539.3" stroke="#4ade80" stroke-width="3" stroke-linecap="round"/>
+  <line x1="300.0" y1="154.0" x2="276.0" y2="231.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="300.0" y1="154.0" x2="324.0" y2="231.0" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="300.0" cy="154.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="276.0" cy="231.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="324.0" cy="231.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="252.0" cy="315.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="348.0" cy="315.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="240.0" cy="385.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="360.0" cy="385.0" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="276.0" cy="385.0" r="5" fill="#a855f7" stroke="#fff" stroke-width="1"/>
+  <circle cx="324.0" cy="385.0" r="5" fill="#a855f7" stroke="#fff" stroke-width="1"/>
+  <circle cx="192.4" cy="453.3" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="407.6" cy="453.3" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="134.6" cy="533.7" r="5" fill="#f97316" stroke="#fff" stroke-width="1"/>
+  <circle cx="459.2" cy="539.3" r="5" fill="#f97316" stroke="#fff" stroke-width="1"/>
+  <circle cx="122.6" cy="533.7" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+  <circle cx="471.2" cy="539.3" r="3.5" fill="#e2e8f0" stroke="#fff" stroke-width="1"/>
+
+  <!-- Split angle arc -->
+  <path d="M 255.4 425.1 A 60 60 0 0 1 343.1 426.8" fill="none" stroke="#f87171" stroke-width="2.5" stroke-linecap="round" opacity="0.8"/>
+  <text x="298.5" y="467.0" text-anchor="middle" font-size="18" font-weight="bold" fill="#f87171" font-family="monospace">110°</text>
+
+  <!-- Title -->
+  <text x="300" y="28" text-anchor="middle" font-size="16" font-weight="bold" fill="#e2e8f0" font-family="sans-serif">硬い + 膝曲がり (110°)</text>
+  <text x="300" y="48" text-anchor="middle" font-size="12" fill="#94a3b8" font-family="sans-serif">膝を曲げて代償するパターン</text>
+
+  <!-- Meta -->
+  <text x="12" y="610" font-size="11" fill="#64748b" font-family="monospace">splitAngle: 110</text>
+  <text x="12" y="626" font-size="11" fill="#64748b" font-family="monospace">pelvisRoll: 0</text>
+  <text x="12" y="642" font-size="11" fill="#64748b" font-family="monospace">trunkLean: 0</text>
+  <text x="12" y="658" font-size="11" fill="#64748b" font-family="monospace">leftKneeBend: 15</text>
+  <text x="12" y="674" font-size="11" fill="#64748b" font-family="monospace">rightKneeBend: 20</text>
+  <text x="12" y="690" font-size="11" fill="#64748b" font-family="monospace">asymmetry: 0</text>
+</svg>
