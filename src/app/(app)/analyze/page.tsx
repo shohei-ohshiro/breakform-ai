@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect, Fragment, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
-import { Loader2, Zap, Info, AlertTriangle, ChevronDown, ChevronUp, Bug, Camera } from "lucide-react";
+import { Loader2, Zap, Info, AlertTriangle, ChevronDown, ChevronUp, Bug, Camera, FlaskConical } from "lucide-react";
 import Link from "next/link";
 import VideoUploader from "@/components/analysis/VideoUploader";
 import TrickSelector from "@/components/analysis/TrickSelector";
@@ -231,6 +231,46 @@ function AnalyzePage() {
     authenticated: boolean;
   } | null>(null);
 
+  // --- Fixture injection mode (debug only) ---
+  const fixtureParam = searchParams.get("fixture");
+  const [fixtureList, setFixtureList] = useState<string[]>([]);
+  const [selectedFixture, setSelectedFixture] = useState<string | null>(
+    fixtureParam,
+  );
+  const [fixtureLandmarks, setFixtureLandmarks] = useState<Landmark[] | null>(
+    null,
+  );
+  const [fixtureLoading, setFixtureLoading] = useState(false);
+  const isFixtureMode = isDebugMode && selectedFixture != null;
+
+  // Load fixture list in debug mode
+  useEffect(() => {
+    if (!isDebugMode) return;
+    fetch("/api/test-fixtures")
+      .then((r) => r.json())
+      .then((d) => setFixtureList(d.fixtures ?? []))
+      .catch(() => {});
+  }, [isDebugMode]);
+
+  // Load fixture landmarks when selected
+  useEffect(() => {
+    if (!selectedFixture) {
+      setFixtureLandmarks(null);
+      return;
+    }
+    setFixtureLoading(true);
+    fetch(`/api/test-fixtures?name=${encodeURIComponent(selectedFixture)}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.landmarks) {
+          setFixtureLandmarks(d.landmarks);
+          setLandmarks(d.landmarks);
+        }
+      })
+      .catch(() => setFixtureLandmarks(null))
+      .finally(() => setFixtureLoading(false));
+  }, [selectedFixture]);
+
   // Fetch usage on mount
   useEffect(() => {
     fetch("/api/usage")
@@ -334,7 +374,13 @@ function AnalyzePage() {
   }, []);
 
   const handleAnalyze = async () => {
-    if (!file || !selectedTrick || !previewUrl) return;
+    // Fixture mode: no file required
+    const useFixture = isFixtureMode && fixtureLandmarks;
+    if (!useFixture && (!file || !selectedTrick || !previewUrl)) return;
+
+    // In fixture mode, default to middle_split trick
+    const trick = selectedTrick ?? (useFixture ? { id: "middle_split", name_ja: "開脚" } as Trick : null);
+    if (!trick) return;
 
     setError(null);
     setErrorCode(null);
@@ -344,13 +390,20 @@ function AnalyzePage() {
     try {
       setState("detecting");
 
-      const isVideo = file.type.startsWith("video/");
       let frames: { timestamp: number; landmarks: Landmark[] }[] = [];
       const fps = 10;
       let duration = 0;
       let sampling: SamplingInfo | undefined;
+      let isVideo = false;
 
-      if (isVideo) {
+      if (useFixture) {
+        // --- Fixture injection: skip MediaPipe entirely ---
+        setProgress(`フィクスチャ注入: ${selectedFixture}`);
+        frames = [{ timestamp: 0, landmarks: fixtureLandmarks }];
+        setLandmarks(fixtureLandmarks);
+        duration = 0;
+      } else if (file!.type.startsWith("video/")) {
+        isVideo = true;
         // Multi-frame extraction for video
         const video = document.getElementById("uploaded-video") as HTMLVideoElement;
         if (!video) throw new Error("動画が見つかりません");
@@ -365,7 +418,7 @@ function AnalyzePage() {
         duration = video.duration;
         setProgress(`動画から骨格を抽出中... (${duration.toFixed(1)}秒)`);
 
-        const technique = selectedTrick.id as TechniqueId;
+        const technique = trick.id as TechniqueId;
         const result = await extractPoseTimeSeries(
           video,
           technique,
@@ -430,9 +483,9 @@ function AnalyzePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          technique: selectedTrick.id as TechniqueId,
-          trickNameJa: selectedTrick.name_ja,
-          trickId: selectedTrick.id,
+          technique: trick.id as TechniqueId,
+          trickNameJa: trick.name_ja,
+          trickId: trick.id,
           frames,
           sourceType: isVideo ? "video" : "image",
           fps,
@@ -457,14 +510,14 @@ function AnalyzePage() {
       setResult(analysisResult);
       setState("complete");
 
-      if (selectedTrick) {
+      if (trick) {
         const topLim = analysisResult.structuredSummary?.primaryLimiters[0];
         const msFeature = analysisResult.middleSplitFeatures;
 
         const historyComparable =
           analysisResult.structuredSummary?.meta.historyComparable === true;
         const middleSplitEntry =
-          historyComparable && msFeature && selectedTrick.id === "middle_split"
+          historyComparable && msFeature && trick.id === "middle_split"
             ? {
                 splitAngle: Math.round(msFeature.splitAngleRaw * 10) / 10,
                 leftRightAngleDiff:
@@ -479,8 +532,8 @@ function AnalyzePage() {
             : undefined;
 
         const nextHistory = addHistoryEntry({
-          technique: selectedTrick.id as TechniqueId,
-          trickNameJa: selectedTrick.name_ja,
+          technique: trick.id as TechniqueId,
+          trickNameJa: trick.name_ja,
           score: analysisResult.score ?? 0,
           qualityLevel: analysisResult.qualityLevel ?? "reference",
           reliability: analysisResult.reliability ?? 0,
@@ -494,7 +547,7 @@ function AnalyzePage() {
         // just-saved entry at [0] — the prior middle_split run is the first
         // subsequent entry that has comparable fields.
         if (
-          selectedTrick.id === "middle_split" &&
+          trick.id === "middle_split" &&
           isFeatureEnabled("history_local_storage") &&
           nextHistory.length >= 2
         ) {
@@ -531,7 +584,11 @@ function AnalyzePage() {
     isFeatureEnabled("middle_split_precapture_check") &&
     preCheck?.blocked === true &&
     !overridePreCheck;
-  const canAnalyze = !!file && !!selectedTrick && !isAnalyzing && !preCheckBlocks;
+  const canAnalyze =
+    (!!file && !!selectedTrick && !preCheckBlocks) ||
+    (isFixtureMode && !!fixtureLandmarks && !fixtureLoading)
+      ? !isAnalyzing
+      : false;
 
   return (
     <div className="min-h-screen bg-gray-950">
@@ -549,6 +606,59 @@ function AnalyzePage() {
           <div className="mb-6 flex items-center gap-2 p-3 bg-purple-500/10 border border-purple-500/30 rounded-lg text-sm text-purple-300">
             <Bug className="w-4 h-4 flex-shrink-0" />
             <span>デバッグモード ON — 分析後に詳細JSON（feature / event / rule_result）を表示します</span>
+          </div>
+        )}
+
+        {/* Fixture Injection Mode (debug only) */}
+        {isDebugMode && fixtureList.length > 0 && (
+          <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-3">
+            <div className="flex items-center gap-2 text-sm text-amber-300">
+              <FlaskConical className="w-4 h-4 flex-shrink-0" />
+              <span className="font-medium">フィクスチャ注入モード</span>
+              {isFixtureMode && (
+                <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-500/40">
+                  有効
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-amber-200/70">
+              MediaPipeをバイパスし、事前定義されたランドマークデータで分析パイプラインをテストします。画像アップロード不要。
+            </p>
+            <div className="flex items-center gap-2">
+              <select
+                value={selectedFixture ?? ""}
+                onChange={(e) =>
+                  setSelectedFixture(e.target.value || null)
+                }
+                className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-amber-500/50"
+              >
+                <option value="">-- フィクスチャを選択 --</option>
+                {fixtureList.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+              {selectedFixture && (
+                <button
+                  onClick={() => setSelectedFixture(null)}
+                  className="text-xs text-gray-400 hover:text-gray-200 px-2 py-1"
+                >
+                  解除
+                </button>
+              )}
+            </div>
+            {fixtureLoading && (
+              <div className="flex items-center gap-2 text-xs text-amber-300/70">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                ランドマーク読み込み中...
+              </div>
+            )}
+            {fixtureLandmarks && !fixtureLoading && (
+              <p className="text-xs text-green-300/80">
+                ✓ {fixtureLandmarks.length} ランドマーク読み込み済み — 「分析開始」で実行できます
+              </p>
+            )}
           </div>
         )}
 
@@ -693,7 +803,7 @@ function AnalyzePage() {
             {/* Middle Split Overlay — analysis result on image */}
             {landmarks &&
               previewUrl &&
-              selectedTrick?.id === "middle_split" &&
+              (selectedTrick?.id === "middle_split" || isFixtureMode) &&
               result?.middleSplitFeatures && (
                 <div>
                   <h3 className="text-sm font-medium text-gray-400 mb-2">
@@ -1024,7 +1134,7 @@ function AnalyzePage() {
             )}
 
             {/* Middle Split — structured summary driven layout */}
-            {selectedTrick?.id === "middle_split" &&
+            {(selectedTrick?.id === "middle_split" || isFixtureMode) &&
               result?.structuredSummary &&
               isFeatureEnabled("middle_split_structured_summary") && (
                 isFeatureEnabled("middle_split_ux_v1_1") ? (
