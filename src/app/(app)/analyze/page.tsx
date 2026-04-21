@@ -786,14 +786,17 @@ function AnalyzePage() {
 
           {/* Right: Results */}
           <div className="space-y-6">
-            {/* Pose Canvas */}
-            {landmarks && previewUrl && (
+            {/* Pose Canvas — falls back to a neutral backdrop when running a fixture (no uploaded image exists) */}
+            {landmarks && (previewUrl || isFixtureMode) && (
               <div>
                 <h3 className="text-sm font-medium text-gray-400 mb-2">
                   骨格検出結果
+                  {!previewUrl && isFixtureMode && (
+                    <span className="ml-2 text-[10px] text-amber-400/70">（フィクスチャ背景）</span>
+                  )}
                 </h3>
                 <PoseCanvas
-                  imageUrl={previewUrl}
+                  imageUrl={previewUrl ?? "/fixture-backdrop.svg"}
                   landmarks={landmarks}
                   height={500}
                 />
@@ -802,7 +805,7 @@ function AnalyzePage() {
 
             {/* Middle Split Overlay — analysis result on image */}
             {landmarks &&
-              previewUrl &&
+              (previewUrl || isFixtureMode) &&
               (selectedTrick?.id === "middle_split" || isFixtureMode) &&
               result?.middleSplitFeatures && (
                 <div>
@@ -810,7 +813,7 @@ function AnalyzePage() {
                     分析オーバーレイ
                   </h3>
                   <MiddleSplitOverlay
-                    imageUrl={previewUrl}
+                    imageUrl={previewUrl ?? "/fixture-backdrop.svg"}
                     landmarks={landmarks}
                     features={result.middleSplitFeatures}
                   />
